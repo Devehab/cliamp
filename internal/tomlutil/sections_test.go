@@ -128,3 +128,24 @@ title = "B"
 		t.Fatalf("ParseNamedSections = %v, want %v (unknown section fields leaked)", got, want)
 	}
 }
+
+func TestUnknownHeaders(t *testing.T) {
+	data := []byte(`[[station]]
+name = "A"
+
+[[stations]]
+name = "B"
+
+  [station]
+url = "http://c/"
+# [[comment]]
+`)
+	got := UnknownHeaders(data, "station")
+	want := []string{"[[stations]]", "[station]"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("UnknownHeaders = %v, want %v", got, want)
+	}
+	if got := UnknownHeaders([]byte("[[station]]\nname = \"A\"\n"), "station"); got != nil {
+		t.Fatalf("UnknownHeaders = %v, want nil", got)
+	}
+}

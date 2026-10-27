@@ -59,3 +59,21 @@ func ParseNamedSections(data []byte, sections []string, emit func(section string
 	}
 	flush()
 }
+
+// UnknownHeaders returns the table headers in data, such as [[stations]] or
+// [station], that ParseNamedSections would skip for the given section names,
+// in document order. Callers use it to warn about sections that are ignored.
+func UnknownHeaders(data []byte, sections ...string) []string {
+	known := make(map[string]bool, len(sections))
+	for _, s := range sections {
+		known["[["+s+"]]"] = true
+	}
+	var unknown []string
+	for rawLine := range strings.SplitSeq(string(data), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") && !known[line] {
+			unknown = append(unknown, line)
+		}
+	}
+	return unknown
+}
