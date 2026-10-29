@@ -34,18 +34,16 @@ func ParseNamedSections(data []byte, sections []string, emit func(section string
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if name, ok := headers[line]; ok {
-			flush()
-			fields = make(map[string]string)
-			cur = name
-			continue
-		}
-		if strings.HasPrefix(line, "[[") && strings.HasSuffix(line, "]]") {
-			// Unrecognized array-table header: flush the section we were in so
-			// its fields cannot leak into the next recognized section.
+		if header, ok := tableHeader(line); ok {
 			flush()
 			fields = nil
 			cur = ""
+			if name, ok := headers[header]; ok {
+				fields = make(map[string]string)
+				cur = name
+			}
+			// An unrecognized header still ends the section we were in, so its
+			// fields cannot leak into the previous recognized section.
 			continue
 		}
 		if fields == nil {
@@ -70,10 +68,21 @@ func UnknownHeaders(data []byte, sections ...string) []string {
 	}
 	var unknown []string
 	for rawLine := range strings.SplitSeq(string(data), "\n") {
-		line := strings.TrimSpace(rawLine)
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") && !known[line] {
-			unknown = append(unknown, line)
+		if header, ok := tableHeader(strings.TrimSpace(rawLine)); ok && !known[header] {
+			unknown = append(unknown, header)
 		}
 	}
 	return unknown
+}
+
+// tableHeader reports whether line is a table header such as [[station]] or
+// [station], and returns it without a trailing comment.
+func tableHeader(line string) (string, bool) {
+	if !strings.HasPrefix(line, "[") {
+		return "", false
+	}
+	if i := strings.IndexByte(line, '#'); i >= 0 {
+		line = strings.TrimSpace(line[:i])
+	}
+	return line, strings.HasSuffix(line, "]")
 }

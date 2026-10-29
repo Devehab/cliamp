@@ -149,3 +149,25 @@ url = "http://c/"
 		t.Fatalf("UnknownHeaders = %v, want nil", got)
 	}
 }
+
+func TestParseNamedSectionsHeaderComments(t *testing.T) {
+	data := []byte(`[[station]] # first
+name = "A"
+
+[station] # not an array table
+name = "leaked"
+
+[[stations]] # typo
+name = "B"
+`)
+	var got []string
+	ParseNamedSections(data, []string{"station"}, func(_ string, f map[string]string) {
+		got = append(got, f["name"])
+	})
+	if want := []string{"A"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseNamedSections = %v, want %v", got, want)
+	}
+	if got, want := UnknownHeaders(data, "station"), []string{"[station]", "[[stations]]"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("UnknownHeaders = %v, want %v", got, want)
+	}
+}
