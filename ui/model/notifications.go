@@ -40,7 +40,9 @@ func (m *Model) notifyPlaybackChange() {
 		return
 	}
 	track, state := m.playbackState()
-	m.artRef.set(state.Track.ArtURL)
+	if m.artRef != nil && m.artRef.get() != state.Track.ArtURL {
+		m.artRef.set(state.Track.ArtURL)
+	}
 	key := state
 	key.Position = key.Position.Truncate(time.Second)
 	if m.notice.sent && key == m.notice.state {
@@ -76,7 +78,7 @@ func (m *Model) playbackState() (playlist.Track, playback.State) {
 	}
 	track, _ := m.currentPlaybackTrack()
 	artist, title := m.resolveTrackDisplay(track)
-	position, duration := m.playbackClock()
+	position, duration := m.cachedClock()
 	return track, playback.State{
 		Status: status,
 		Track: playback.Track{
@@ -93,7 +95,25 @@ func (m *Model) playbackState() (playlist.Track, playback.State) {
 		VolumeDB:    m.player.Volume(),
 		VolumeMinDB: m.player.VolumeMin(),
 		Position:    position,
-		Seekable:    m.player.Seekable(),
+		Seekable:    m.playerSeekable(),
+	}
+}
+
+type artworkCacheKey struct {
+	path            string
+	albumArtURL     string
+	playingProvider string
+	providerName    string
+}
+
+type artworkCache struct {
+	key artworkCacheKey
+	url string
+}
+
+func (m *Model) clearArtworkCache() {
+	if m.artworkCache != nil {
+		*m.artworkCache = artworkCache{}
 	}
 }
 
@@ -105,6 +125,15 @@ func (m *Model) playbackState() (playlist.Track, playback.State) {
 // provider keep playing while m.provider points at the new one. Ask the
 // provider that owns the track, and fall back to the active one.
 func (m *Model) artworkURL(track playlist.Track) string {
+	key := artworkCacheKey{
+		path:            track.Path,
+		albumArtURL:     track.AlbumArtURL,
+		playingProvider: m.playingProvider,
+		providerName:    providerName(m.provider),
+	}
+	if m.artworkCache != nil && m.artworkCache.url != "" && m.artworkCache.key == key {
+		return m.artworkCache.url
+	}
 	prov := m.provider
 	if name := m.playingProvider; name != "" && (prov == nil || prov.Name() != name) {
 		for _, entry := range m.providers {
@@ -114,12 +143,22 @@ func (m *Model) artworkURL(track playlist.Track) string {
 			}
 		}
 	}
+	resolved := track.AlbumArtURL
 	if artwork, ok := prov.(provider.ArtworkProvider); ok {
 		if url, found := artwork.ArtworkFor(track); found {
-			return url
+			resolved = url
 		}
 	}
-	return track.AlbumArtURL
+	if resolved != "" {
+		if m.artworkCache == nil {
+			m.artworkCache = &artworkCache{}
+		}
+		m.artworkCache.key = key
+		m.artworkCache.url = resolved
+	} else {
+		m.clearArtworkCache()
+	}
+	return resolved
 }
 
 // playerStatus returns the player state that Lua plugins see: "playing",
@@ -354,7 +393,8 @@ const progressReportInterval = 15 * time.Second
 // tickProgressReport pushes an interim position update for the playing track to
 // providers that accept them, at most once per progressReportInterval.
 func (m *Model) tickProgressReport(now time.Time) {
-	if m.player == nil || !m.player.IsPlaying() || m.player.IsPaused() {
+	if m.player == nil || !m.player.IsPlaying() || m.player.IsPaused() ||
+		m.buffering || m.seek.active || m.seek.inFlight || m.seek.pending {
 		return
 	}
 	if !m.lastProgressReport.IsZero() && now.Sub(m.lastProgressReport) < progressReportInterval {
@@ -377,15 +417,21 @@ func (m *Model) tickProgressReport(now time.Time) {
 	})
 }
 
-// hasPlaybackState reports whether any provider stores local listening state,
-// so a render pass can decide whether to reserve the played-marker column.
-func (m Model) hasPlaybackState() bool {
-	for _, p := range m.playbackStateReporters() {
+// hasPlaybackStateFrom reports whether any reporter in reporters stores local
+// listening state.
+func hasPlaybackStateFrom(reporters []provider.PlaybackStateReporter) bool {
+	for _, p := range reporters {
 		if p.HasPlaybackState() {
 			return true
 		}
 	}
 	return false
+}
+
+// hasPlaybackState reports whether any provider stores local listening state,
+// so a render pass can decide whether to reserve the played-marker column.
+func (m Model) hasPlaybackState() bool {
+	return hasPlaybackStateFrom(m.playbackStateReporters())
 }
 
 // playbackStateReporters returns the providers that keep listening state

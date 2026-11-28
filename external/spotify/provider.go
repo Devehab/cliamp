@@ -2,6 +2,7 @@ package spotify
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -58,6 +59,9 @@ func New(session *Session, clientID string, bitrate int) *SpotifyProvider {
 	}
 }
 
+// newSessionSilent creates a session from stored credentials. Tests replace it.
+var newSessionSilent = NewSessionSilent
+
 // ensureSession tries to create a session using stored credentials only
 // (no browser). Returns playlist.ErrNeedsAuth if interactive sign-in is needed.
 func (p *SpotifyProvider) ensureSession() error {
@@ -74,11 +78,19 @@ func (p *SpotifyProvider) ensureSession() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	sess, err := NewSessionSilent(ctx, clientID)
+	sess, err := newSessionSilent(ctx, clientID)
 	if err != nil {
-		return playlist.ErrNeedsAuth
+		if errors.Is(err, playlist.ErrNeedsAuth) {
+			return playlist.ErrNeedsAuth
+		}
+		return err
 	}
 	p.mu.Lock()
+	if p.session != nil {
+		p.mu.Unlock()
+		sess.Close()
+		return nil
+	}
 	p.session = sess
 	p.resetSessionScopedStateLocked()
 	p.mu.Unlock()
@@ -123,36 +135,52 @@ func (p *SpotifyProvider) Authenticate() error {
 
 	sess, err := signIn(ctx, clientID, existing)
 
+	var toClose *Session
 	p.mu.Lock()
 	if p.authGen == gen {
 		p.authCancel = nil
 	}
+	if err == nil {
+		if sess != nil {
+			if p.authGen != gen {
+				toClose = sess
+			} else {
+				if p.session != nil && p.session != sess {
+					toClose = p.session
+				}
+				p.session = sess
+				p.resetSessionScopedStateLocked()
+			}
+		} else {
+			p.resetSessionScopedStateLocked()
+		}
+	}
 	p.mu.Unlock()
-
+	if toClose != nil {
+		toClose.Close()
+	}
 	if err != nil {
 		return err
 	}
-	p.mu.Lock()
-	if sess != nil {
-		p.session = sess
-	}
-	p.resetSessionScopedStateLocked()
-	p.mu.Unlock()
 	return nil
 }
 
 // Close releases the session if one was created.
 func (p *SpotifyProvider) Close() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.authGen++
 	if p.authCancel != nil {
 		p.authCancel()
 		p.authCancel = nil
 	}
-	if p.session != nil {
-		p.session.Close()
-		p.session = nil
+	sess := p.session
+	p.session = nil
+	if sess != nil {
 		p.resetSessionScopedStateLocked()
+	}
+	p.mu.Unlock()
+	if sess != nil {
+		sess.Close()
 	}
 }
 
@@ -163,6 +191,7 @@ func (p *SpotifyProvider) Refresh() {
 	defer p.mu.Unlock()
 	p.listCache = nil
 	p.trackCache = make(map[string]*playlistCache)
+	clear(p.pending)
 	clear(p.writable)
 }
 
@@ -173,6 +202,7 @@ func (p *SpotifyProvider) resetSessionScopedStateLocked() {
 	p.userID = ""
 	p.meFetched = false
 	p.listCache = nil
+	clear(p.pending)
 	clear(p.writable)
 }
 

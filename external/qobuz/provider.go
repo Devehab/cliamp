@@ -46,6 +46,8 @@ const favoritesPageSize = 100
 // fair cross-section. Matches the favorite tracks cap.
 const randomTracksLimit = 500
 
+const maxTrackCacheEntries = 1000
+
 // TrackURIPrefix is the custom URI scheme for Qobuz tracks. Track paths are
 // "qobuz://track/<id>". The player resolves them to a fresh signed URL at
 // play time through the SourceResolver registered in providers.go, so queue
@@ -102,8 +104,11 @@ func (p *QobuzProvider) ensureClient() (*client, error) {
 	defer cancel()
 	c, err := newClientSilent(ctx, apiBaseURL)
 	if err != nil {
-		applog.Debug("qobuz: silent auth failed, prompting sign-in: %v", err)
-		return nil, playlist.ErrNeedsAuth
+		if errors.Is(err, playlist.ErrNeedsAuth) || errors.Is(err, errUnauthorized) {
+			applog.Debug("qobuz: silent auth failed, prompting sign-in: %v", err)
+			return nil, playlist.ErrNeedsAuth
+		}
+		return nil, err
 	}
 
 	p.mu.Lock()
@@ -141,22 +146,20 @@ func (p *QobuzProvider) Authenticate() error {
 	p.mu.Lock()
 	if p.authGen == gen {
 		p.authCancel = nil
+		if err == nil {
+			p.client = c
+		}
 	}
 	p.mu.Unlock()
 
-	if err != nil {
-		return err
-	}
-	p.mu.Lock()
-	p.client = c
-	p.mu.Unlock()
-	return nil
+	return err
 }
 
 // Close cancels any in-progress sign-in. Implements provider.Closer.
 func (p *QobuzProvider) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.authGen++
 	if p.authCancel != nil {
 		p.authCancel()
 		p.authCancel = nil
@@ -281,6 +284,9 @@ func (p *QobuzProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 	tracks := tracksFromAPI(apiTracks, nil)
 
 	p.mu.Lock()
+	if _, exists := p.trackCache[playlistID]; !exists && len(p.trackCache) >= maxTrackCacheEntries {
+		clear(p.trackCache)
+	}
 	p.trackCache[playlistID] = tracks
 	p.mu.Unlock()
 	return slices.Clone(tracks), nil
@@ -383,7 +389,7 @@ func (p *QobuzProvider) Artists() ([]provider.ArtistInfo, error) {
 	defer cancel()
 
 	var artists []provider.ArtistInfo
-	for offset := 0; ; offset += favoritesPageSize {
+	for pageNum, offset := 0, 0; pageNum < maxPages; pageNum, offset = pageNum+1, offset+favoritesPageSize {
 		page, err := c.favoriteArtists(ctx, offset, favoritesPageSize)
 		if err != nil {
 			return nil, p.mapErr(c, err)

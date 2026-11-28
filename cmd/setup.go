@@ -737,14 +737,14 @@ func providers() []providerSpec {
 				if id, err := strconv.Atoi(strings.TrimSpace(v["api_id"])); err != nil || id <= 0 {
 					return errors.New("API ID must be the positive number from my.telegram.org/apps")
 				}
-				hash := strings.TrimSpace(v["api_hash"])
+				hash := resolveSetupEnv(v["api_hash"])
 				if len(hash) != 32 {
 					return errors.New("api hash must be 32 hexadecimal characters")
 				}
 				if _, err := hex.DecodeString(hash); err != nil {
 					return errors.New("API hash must be 32 hexadecimal characters")
 				}
-				if phone := digitsOnly(v["phone"]); len(phone) < 7 || len(phone) > 15 {
+				if phone := digitsOnly(resolveSetupEnv(v["phone"])); len(phone) < 7 || len(phone) > 15 {
 					return errors.New("phone must be in international format, e.g. +5491100000000")
 				}
 				for _, chat := range setupChats(v["chats"]) {
@@ -820,6 +820,7 @@ func providers() []providerSpec {
 				if p == nil {
 					return chatPick{}, errors.New("telegram is not configured yet")
 				}
+				defer p.Close()
 				dialogs, err := p.Dialogs()
 				if err != nil {
 					return chatPick{}, fmt.Errorf("%w\nsave the section and press s to sign in, or start cliamp once", err)
@@ -888,6 +889,14 @@ func digitsOnly(phone string) string {
 	return b.String()
 }
 
+func resolveSetupEnv(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if name, ok := config.EnvRef(trimmed); ok {
+		return strings.TrimSpace(os.Getenv(name))
+	}
+	return trimmed
+}
+
 // telegramConfigFrom builds the [telegram] section the wizard writes, so
 // setup can sign in right after saving it.
 func telegramConfigFrom(v map[string]string) config.TelegramConfig {
@@ -895,9 +904,9 @@ func telegramConfigFrom(v map[string]string) config.TelegramConfig {
 	mb, _ := strconv.Atoi(strings.TrimSpace(v["buffer_mb"]))
 	return config.TelegramConfig{
 		AppID:    id,
-		AppHash:  strings.TrimSpace(v["api_hash"]),
-		Phone:    strings.TrimSpace(v["phone"]),
-		Password: strings.TrimSpace(v["password"]),
+		AppHash:  resolveSetupEnv(v["api_hash"]),
+		Phone:    resolveSetupEnv(v["phone"]),
+		Password: resolveSetupEnv(v["password"]),
 		Chats:    setupChats(v["chats"]),
 		BufferMB: mb,
 	}
@@ -986,6 +995,7 @@ type setupModel struct {
 	chatErr     error
 	chatWarn    error
 	chatLoading bool
+	chatLoadGen uint64            // identifies the active chat load request
 	chatTouched bool              // the user toggled something in the checklist
 	chatNote    string            // one-line feedback about the selection
 	chatNames   map[string]string // peer key -> title, for the form summary
@@ -1058,19 +1068,20 @@ func runValidateCmd(spec providerSpec, values map[string]string) tea.Cmd {
 }
 
 type chatsLoadedMsg struct {
+	gen     uint64
 	options []chatOption
 	checked map[int]bool
 	err     error
 	warn    error
 }
 
-func loadChatsCmd(spec providerSpec, values map[string]string) tea.Cmd {
+func loadChatsCmd(gen uint64, spec providerSpec, values map[string]string) tea.Cmd {
 	return func() tea.Msg {
 		pick, err := spec.pickChats(values)
 		if err != nil {
-			return chatsLoadedMsg{err: err}
+			return chatsLoadedMsg{gen: gen, err: err}
 		}
-		return chatsLoadedMsg{options: pick.options, checked: checkedChats(pick.options, pick.selected), warn: pick.warn}
+		return chatsLoadedMsg{gen: gen, options: pick.options, checked: checkedChats(pick.options, pick.selected), warn: pick.warn}
 	}
 }
 
@@ -1142,7 +1153,7 @@ func (m *setupModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case chatsLoadedMsg:
-		if m.stage != stageChats {
+		if m.stage != stageChats || msg.gen != m.chatLoadGen {
 			return m, nil
 		}
 		m.chatLoading = false
@@ -1267,6 +1278,7 @@ func (m *setupModel) startProvider(idx int) {
 	m.awaitingSave = false
 	m.saveFailed = nil
 	m.signInLabel, m.signInAction, m.signInRequested = "", nil, false
+	m.chatLoadGen++
 	m.chatItems, m.chatChecked, m.chatCursor, m.chatErr, m.chatWarn, m.chatLoading = nil, nil, 0, nil, nil, false
 	m.chatTouched, m.chatNote = false, ""
 	m.chatNames = nil
@@ -1402,6 +1414,7 @@ const chatPageSize = 12
 func (m *setupModel) chatsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.chatLoading {
 		if msg.String() == "esc" {
+			m.chatLoadGen++
 			m.chatLoading = false
 			m.stage = stageForm
 		}
@@ -1502,12 +1515,14 @@ func (m *setupModel) openChats() (tea.Model, tea.Cmd) {
 	if spec.pickChats == nil {
 		return m, nil
 	}
+	m.chatLoadGen++
+	gen := m.chatLoadGen
 	m.stage = stageChats
 	m.chatLoading = true
 	m.chatErr, m.chatWarn = nil, nil
 	m.chatCursor = 0
 	m.chatTouched = false
-	return m, tea.Batch(spinTickCmd(), loadChatsCmd(spec, maps.Clone(m.values)))
+	return m, tea.Batch(spinTickCmd(), loadChatsCmd(gen, spec, maps.Clone(m.values)))
 }
 
 // chatsSummary says how many chats the field will keep, so an empty selection

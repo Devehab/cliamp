@@ -27,9 +27,11 @@ func registerUIAPI(L *lua.LState, cliamp *lua.LTable, p *Plugin, m *Manager) {
 		}
 		var options []string
 		if list, ok := opts.RawGetString("options").(*lua.LTable); ok {
-			list.ForEach(func(_, value lua.LValue) {
-				options = append(options, value.String())
-			})
+			n := list.Len()
+			options = make([]string, 0, n)
+			for i := 1; i <= n; i++ {
+				options = append(options, list.RawGetInt(i).String())
+			}
 		}
 		if len(options) == 0 {
 			return pushErr(L, "cliamp.ui.select: options is empty")
@@ -40,22 +42,22 @@ func registerUIAPI(L *lua.LState, cliamp *lua.LTable, p *Plugin, m *Manager) {
 		}
 		cursor := optIntField(L, opts, "cursor")
 		cancelFn, _ := opts.RawGetString("on_cancel").(*lua.LFunction)
-		onCancel := func() {}
+		var onCancel func()
 		if cancelFn != nil {
 			onCancel = func() {
-				m.enqueue(p, "ui.select cancel", func() {
+				m.enqueueSafe(p, "ui.select cancel", func() {
 					m.call(p, "ui.select cancel", hookTimeout, 0, fixedArgs(cancelFn))
 				})
 			}
 		}
 		up.ShowSelect(title, options, cursor, func(index int) {
-			if index < 0 {
-				return
+			arg := lua.LNumber(-1)
+			if index >= 0 {
+				arg = lua.LNumber(index + 1)
 			}
-			// The callback runs on the UI goroutine, so it only queues the Lua
-			// call: the plugin keeps its single-callback ordering.
-			m.enqueue(p, "ui.select", func() {
-				m.call(p, "ui.select", hookTimeout, 0, fixedArgs(fn, lua.LNumber(index+1)))
+			// Queue the callback under m.mu so Close cannot race with a send.
+			m.enqueueSafe(p, "ui.select", func() {
+				m.call(p, "ui.select", hookTimeout, 0, fixedArgs(fn, arg))
 			})
 		}, onCancel)
 		L.Push(lua.LTrue)

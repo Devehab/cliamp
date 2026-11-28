@@ -1,7 +1,6 @@
 package model
 
 import (
-	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,29 +17,66 @@ import (
 const paneRefreshInterval = 50 * time.Millisecond
 
 type paneCacheEntry struct {
+	rows int
+	cols int
 	text string
 	at   time.Time
+}
+
+type slotVisKey struct {
+	region ui.Region
+	pane   string
 }
 
 // slotVisualizers keeps one Visualizer per pane that shows a built-in mode.
 // They share the primary analysis through SetBands, so a second pane costs a
 // driver render, not a second FFT.
 type slotVisualizers struct {
-	mu     sync.Mutex
-	byName map[string]*ui.Visualizer
+	mu       sync.Mutex
+	bySlot   map[slotVisKey]*ui.Visualizer
+	hasSlots atomic.Bool
 }
 
 func newSlotVisualizers() *slotVisualizers {
-	return &slotVisualizers{byName: make(map[string]*ui.Visualizer)}
+	return &slotVisualizers{bySlot: make(map[slotVisKey]*ui.Visualizer)}
+}
+
+// prune removes visualizers for panes no longer registered in active.
+func (s *slotVisualizers) prune(active []ui.PaneSpec) {
+	if !s.hasSlots.Load() {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.bySlot) == 0 {
+		s.hasSlots.Store(false)
+		return
+	}
+	for key := range s.bySlot {
+		keep := false
+		for _, spec := range active {
+			if spec.Region == key.region && spec.Pane == key.pane && spec.Vis != "" {
+				keep = true
+				break
+			}
+		}
+		if !keep {
+			delete(s.bySlot, key)
+		}
+	}
+	s.hasSlots.Store(len(s.bySlot) > 0)
 }
 
 // tickAll advances every pane visualizer with the primary's context, so drivers
 // that keep their own state (stereo levels, rain, peak holds) animate instead of
 // staying at rest.
 func (s *slotVisualizers) tickAll(ctx ui.VisTickContext, samples []float64) {
+	if !s.hasSlots.Load() {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, v := range s.byName {
+	for _, v := range s.bySlot {
 		// Wave, Scope and Heartbeat draw the raw samples; the primary's analysis
 		// produced them, so the pane copies instead of analyzing again.
 		v.SetWaveSamples(samples)
@@ -48,13 +84,14 @@ func (s *slotVisualizers) tickAll(ctx ui.VisTickContext, samples []float64) {
 	}
 }
 
-func (s *slotVisualizers) get(name string, mode ui.VisMode, sampleRate float64) *ui.Visualizer {
+func (s *slotVisualizers) get(key slotVisKey, mode ui.VisMode, sampleRate float64) *ui.Visualizer {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	v, ok := s.byName[name]
+	v, ok := s.bySlot[key]
 	if !ok {
 		v = ui.NewVisualizer(sampleRate)
-		s.byName[name] = v
+		s.bySlot[key] = v
+		s.hasSlots.Store(true)
 	}
 	v.Mode = mode
 	return v
@@ -69,22 +106,46 @@ func newPaneCache() *paneCache {
 	return &paneCache{entries: make(map[string]paneCacheEntry)}
 }
 
-func (c *paneCache) get(key string) (paneCacheEntry, bool) {
+func (c *paneCache) get(name string, rows, cols int) (paneCacheEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entry, ok := c.entries[key]
-	return entry, ok
+	entry, ok := c.entries[name]
+	if !ok || entry.rows != rows || entry.cols != cols {
+		return paneCacheEntry{}, false
+	}
+	return entry, true
 }
 
-func (c *paneCache) set(key, text string) {
+func (c *paneCache) set(name string, rows, cols int, text string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[key] = paneCacheEntry{text: text, at: time.Now()}
+	c.entries[name] = paneCacheEntry{rows: rows, cols: cols, text: text, at: time.Now()}
+}
+
+func (c *paneCache) prune(active []ui.PaneSpec) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.entries) == 0 {
+		return
+	}
+	for name := range c.entries {
+		keep := false
+		for _, spec := range active {
+			if spec.Pane == name || spec.Vis == name {
+				keep = true
+				break
+			}
+		}
+		if !keep {
+			delete(c.entries, name)
+		}
+	}
 }
 
 // SetPaneSet wires the runtime layout registry.
 func (m *Model) SetPaneSet(panes *ui.PaneSet) {
 	m.panes = panes
+	m.panePruned = false
 	if m.paneCache == nil {
 		m.paneCache = newPaneCache()
 	}
@@ -115,15 +176,21 @@ func paneWeights(panes []ui.PaneSpec) []int {
 
 // renderPaneVis renders a pane that has a visualizer assigned. A built-in name
 // uses a shared-analysis Visualizer; anything else is a plugin visualizer.
-func (m Model) renderPaneVis(vis string, rows, cols int) string {
+func (m Model) renderPaneVis(region ui.Region, pane, vis string, rows, cols int) string {
 	if mode, ok := ui.StringToVisModeExact(vis); ok {
 		if m.slotVis == nil {
 			return ""
 		}
-		v := m.slotVis.get(vis, mode, 44100)
+		sr := 44100.0
+		if m.player != nil && m.player.SampleRate() > 0 {
+			sr = float64(m.player.SampleRate())
+		}
+		v := m.slotVis.get(slotVisKey{region: region, pane: pane}, mode, sr)
 		v.Rows = rows
 		v.Cols = cols
-		v.SetBands(m.vis.SmoothedBands())
+		if len(v.SmoothedBands()) == len(m.vis.SmoothedBands()) {
+			v.SetBands(m.vis.SmoothedBands())
+		}
 		return v.Render()
 	}
 	return m.renderPluginPane(vis, rows, cols)
@@ -134,9 +201,8 @@ func (m Model) renderPluginPane(name string, rows, cols int) string {
 	if m.luaMgr == nil || rows <= 0 || cols <= 0 {
 		return ""
 	}
-	key := fmt.Sprintf("%s|%d|%d", name, rows, cols)
 	if m.paneCache != nil {
-		if entry, ok := m.paneCache.get(key); ok && time.Since(entry.at) < paneRefreshInterval {
+		if entry, ok := m.paneCache.get(name, rows, cols); ok && time.Since(entry.at) < paneRefreshInterval {
 			return entry.text
 		}
 	}
@@ -148,7 +214,7 @@ func (m Model) renderPluginPane(name string, rows, cols int) string {
 	// API alternates an invisible reset so the line counts as changed, and the
 	// cache would swallow that and leave the image stale.
 	if m.paneCache != nil && !strings.Contains(text, "\U0010EEEE") {
-		m.paneCache.set(key, text)
+		m.paneCache.set(name, rows, cols, text)
 	}
 	return text
 }

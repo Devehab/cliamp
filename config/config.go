@@ -824,6 +824,7 @@ type Config struct {
 	Simplified       bool                         // simplified playback view: track summary and time strip
 	HideHelpBar      bool                         // hide the key-binding hint bar above the status line
 	HideSettingsPane bool                         // close the settings pane beside the playlist
+	KeepSearchOpen   bool                         // keep the Ctrl+F results open after q (queue next) or a (append)
 	ShowMetadata     bool                         // expand highlighted-track metadata below settings (default false)
 	Expanded         bool                         // start with the playlist expanded (the Ctrl+X state)
 	PaddingH         int                          // horizontal padding for the UI frame (default 3)
@@ -853,6 +854,8 @@ type Config struct {
 	Plugins          map[string]map[string]string // per-plugin config from [plugins.*] sections
 	LogLevel         string                       // log level: debug, info, warn, error (default "info")
 	LowPower         bool                         // reduce CPU by lowering UI cadence and disabling visualization
+	lowPowerSavedVis string                       // visualizer saved when clamp() forces "none" in low_power mode
+	lowPowerClamped  bool                         // true when clamp() overwrote Visualizer for low_power mode
 }
 
 // defaultConfig returns a Config with sensible defaults.
@@ -1008,10 +1011,15 @@ func sectionHeader(line string) (string, bool) {
 	return "", false
 }
 
-// canonicalSection returns the name that Load uses for a section header. It
-// ignores letter case, and [yt], [youtube] and [ytmusic] all configure the
-// same YouTube providers.
+// canonicalSection returns the name that Load uses for a section header.
+// It lowercases built-in section names and the plugins. prefix, keeps the
+// letter case of the plugin name after plugins., and maps yt and youtube to
+// ytmusic.
 func canonicalSection(name string) string {
+	const prefix = "plugins."
+	if len(name) >= len(prefix) && strings.EqualFold(name[:len(prefix)], prefix) {
+		return prefix + name[len(prefix):]
+	}
 	name = strings.ToLower(name)
 	switch name {
 	case "yt", "youtube":
@@ -1137,6 +1145,10 @@ func (c *Config) setTopLevel(key, val string) {
 		if v, ok := parseBool(val); ok {
 			c.HideSettingsPane = v
 		}
+	case "keep_search_open":
+		if v, ok := parseBool(val); ok {
+			c.KeepSearchOpen = v
+		}
 	case "show_metadata":
 		if v, ok := parseBool(val); ok {
 			c.ShowMetadata = v
@@ -1170,14 +1182,27 @@ func (c *Config) setTopLevel(key, val string) {
 	}
 }
 
+// validConfigKey reports whether key is valid as a TOML key name.
+func validConfigKey(key string) bool {
+	return strings.TrimSpace(key) != "" && !strings.ContainsAny(key, "\r\n=#[")
+}
+
+// validConfigSection reports whether section is valid as a TOML table header.
+func validConfigSection(section string) bool {
+	return strings.TrimSpace(section) != "" && !strings.ContainsAny(section, "\r\n[]")
+}
+
 // save updates only the given key in the existing config file, preserving
 // all other content, comments, and formatting. If the key doesn't exist,
 // it is appended. If no config file exists, one is created with just that key.
 // The file always ends with a newline. value is the TOML text of the value.
 // The typed savers SaveString, SaveBool, SaveFloat and SaveFloats format it.
 func save(key, value string) error {
-	if strings.ContainsAny(key+value, "\r\n") {
-		return fmt.Errorf("save %s: a key or value holds a line break", key)
+	if !validConfigKey(key) {
+		return fmt.Errorf("save %q: invalid config key", key)
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		return fmt.Errorf("save %s: value holds a line break", key)
 	}
 	line := fmt.Sprintf("%s = %s", key, value)
 	return update(func(data string) string { return editTopLevel(data, key, line) })
@@ -1325,9 +1350,15 @@ type KeyValue struct {
 // the way Load reads them, so section "ytmusic" also edits [youtube] or [yt].
 // A missing section is added at the end, and a missing file is created.
 func SaveSection(section string, kv []KeyValue, owned []string) error {
+	if !validConfigSection(section) {
+		return fmt.Errorf("save [%q]: invalid section name", section)
+	}
 	for _, e := range kv {
-		if strings.ContainsAny(e.Key+e.Value, "\r\n") {
-			return fmt.Errorf("save [%s] %s: a key or value holds a line break", section, e.Key)
+		if !validConfigKey(e.Key) {
+			return fmt.Errorf("save [%s] %q: invalid config key", section, e.Key)
+		}
+		if strings.ContainsAny(e.Value, "\r\n") {
+			return fmt.Errorf("save [%s] %s: value holds a line break", section, e.Key)
 		}
 	}
 	return update(func(data string) string { return editSection(data, section, kv, owned) })
@@ -1464,9 +1495,15 @@ func (c Config) SeekStepLargeDuration() time.Duration {
 
 // clamp constrains all Config fields to their valid ranges.
 func (c *Config) clamp() {
+	if math.IsNaN(c.VolumeMin) || math.IsInf(c.VolumeMin, 0) {
+		c.VolumeMin = -50
+	}
 	c.VolumeMin = max(min(c.VolumeMin, 0), -90)
+	if math.IsNaN(c.Volume) || math.IsInf(c.Volume, 0) {
+		c.Volume = 0
+	}
 	c.Volume = max(min(c.Volume, 6), c.VolumeMin)
-	if c.Speed < 0.25 || c.Speed > 2.0 {
+	if math.IsNaN(c.Speed) || math.IsInf(c.Speed, 0) || c.Speed < 0.25 || c.Speed > 2.0 {
 		c.Speed = 1.0
 	}
 	c.SeekStepLarge = max(min(c.SeekStepLarge, 600), 6)
@@ -1482,6 +1519,10 @@ func (c *Config) clamp() {
 		c.VisRows = max(min(c.VisRows, maxVisRows), 1)
 	}
 	if c.LowPower {
+		if !c.lowPowerClamped {
+			c.lowPowerSavedVis = c.Visualizer
+			c.lowPowerClamped = true
+		}
 		c.Visualizer = "none"
 	}
 }

@@ -343,6 +343,8 @@ cliamp.track.album_art_url()  --> string (file:// or data: URL; resolved on dema
 
 `cliamp.track` reports the track that plays, as `playback.state` does. When you load a playlist during playback, the old track plays on, and `cliamp.track` reports it until the next track starts. For a radio stream, `title` and `artist` come from the stream title when the station sends one. When nothing plays, `cliamp.track` reports the current track of the queue.
 
+The path of a local file is the one cliamp loaded it with. For files named on the command line, such as `cliamp album1`, it is relative to the directory cliamp started in. `cliamp.fs.abs(cliamp.track.path())` returns the full path.
+
 cliamp updates the values of `cliamp.player`, `cliamp.track`, and `cliamp.queue` after it handles each key, message, or tick. `cliamp.player.position()` and `cliamp.player.duration()` read the audio engine directly.
 
 ### cliamp.queue
@@ -437,9 +439,11 @@ cliamp.fs.remove(path)            -- delete file
 cliamp.fs.exists(path)            --> boolean
 cliamp.fs.mkdir(path)             -- create directory (recursive)
 cliamp.fs.listdir(path)           --> {names}, err
+cliamp.fs.cwd()                   --> string, err (the directory cliamp started in)
+cliamp.fs.abs(path)               --> string, err (non-empty local path made absolute against cwd)
 ```
 
-You can write only to the system temp directory (`/tmp/` on Unix), `~/.config/cliamp/`, `~/.local/share/cliamp/`, and `~/Music/cliamp/`. In `~/.config/cliamp/`, you cannot write to the `plugins/` directory, `config.toml`, `radios.toml`, `config.toml.lock`, `favorites.toml.lock`, `history.toml.lock`, `radio_favorites.toml.lock`, `radio_countries.toml.lock`, `playlists.lock`, `cliamp.sock`, `cliamp.sock.pid`, or `plugins.log`. You can read from any path. `cliamp.fs.read` reads only regular files. For a FIFO, a device, or a directory, it returns `nil` and an error, because a read of such a file can block without a limit. On Windows, the config directory resolves to `%APPDATA%\cliamp` unless `HOME` names another directory. If that directory has no `config.toml` and `HOME/.config/cliamp` has one, cliamp keeps the existing directory.
+You can write only to the system temp directory (`/tmp/` on Unix), `~/.config/cliamp/`, `~/.local/share/cliamp/`, and `~/Music/cliamp/`. In `~/.config/cliamp/`, you cannot write to the `plugins/` directory, `config.toml`, `radios.toml`, `favorites.toml`, `history.toml`, `resume.json`, `cliamp.log`, `*_credentials.json`, `config.toml.lock`, `favorites.toml.lock`, `history.toml.lock`, `radio_favorites.toml.lock`, `radio_countries.toml.lock`, `playlists.lock`, `cliamp.sock`, `cliamp.sock.pid`, `cliamp.sock.lock`, or `plugins.log`. You can read from any path. `cliamp.fs.read` reads only regular files. For a FIFO, a device, or a directory, it returns `nil` and an error, because a read of such a file can block without a limit. On Windows, the config directory resolves to `%APPDATA%\cliamp` unless `HOME` names another directory. If that directory has no persisted config or resources yet and `HOME/.config/cliamp` does, cliamp keeps the existing directory.
 
 ### cliamp.json
 
@@ -749,8 +753,8 @@ local p = plugin.register({
 })
 
 -- Called every frame (~20 FPS during playback).
--- bands: table of 10 numbers (0.0-1.0), indices 1-10, eased between
---        analyses as in the built-in spectrum modes
+-- bands: table of 10 numbers (0.0-1.0), indices 1-10, of the sound that
+--        plays now, eased between analyses as in the built-in spectrum modes
 -- frame: monotonic counter
 -- rows: available terminal rows (changes in fullscreen mode)
 -- cols: available terminal columns
@@ -789,6 +793,8 @@ cliamp calls `init` before the first frame after you select the visualizer, with
 
 `render` has a 50 ms limit for each frame. If it runs longer or fails, cliamp shows the previous frame. cliamp also shows the previous frame while another callback of the same plugin runs, so a slow hook does not delay the UI. cliamp runs `init` and `destroy` in order with the events of the plugin, and `render` shows the previous frame until `init` has run.
 
+`bands` belong to the sound that plays now while the plugin is the selected visualizer. In a layout pane (`cliamp.layout.set_vis`), the plugin gets the bands of the selected visualizer.
+
 ## Sandbox
 
 For security, plugins have restricted access. The sandbox removes unsafe standard-library functions and limits file-system access.
@@ -821,12 +827,14 @@ These paths in `~/.config/cliamp/` stay read-only for `cliamp.fs` and for the `c
 - `plugins/`, which contains the plugin files and `plugins/.trust.json`
 - `config.toml`
 - `radios.toml`
+- `favorites.toml`, `history.toml`, `resume.json`, `cliamp.log`, and `*_credentials.json`
 - `config.toml.lock`, `favorites.toml.lock`, `history.toml.lock`, `radio_favorites.toml.lock`, `radio_countries.toml.lock` and `playlists.lock`
 - `cliamp.sock`
 - `cliamp.sock.pid`
+- `cliamp.sock.lock`
 - `plugins.log`
 
-Thus a plugin cannot use `cliamp.fs` to approve plugins, change the exec allowlist, stop the next start of cliamp, or hide its log. A plugin with the exec permission can still write to any path that you can write through `yt-dlp` or `ffmpeg`. Approve a plugin that declares the exec permission only when you trust it.
+Thus a plugin cannot use `cliamp.fs` to approve plugins, change the exec allowlist, stop the next start of cliamp, alter credentials, or hide its log. `cliamp.exec` also rejects `yt-dlp` shell-execution flags and checks `ffmpeg` output paths against the same write allowlist. Approve a plugin that declares the exec permission only when you trust it.
 
 Writing outside these directories, or to a read-only path, raises a Lua error. cliamp resolves symlinks and blocks directory traversal (`..`) before it checks the path. The `cwd` of `cliamp.exec` follows the same rules.
 

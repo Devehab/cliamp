@@ -16,11 +16,67 @@ import (
 
 const restrictedViewSuffix = " [E]"
 
+const spaces64 = "                                                                "
+
+func repeatSpaces(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n <= len(spaces64) {
+		return spaces64[:n]
+	}
+	return strings.Repeat(" ", n)
+}
+
+// ansiASCIIWidth returns the cell width of s when s contains only printable
+// ASCII bytes and CSI escape sequences. It returns false for any other byte.
+func ansiASCIIWidth(s string) (int, bool) {
+	w := 0
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c >= 0x20 && c <= 0x7e {
+			w++
+			i++
+			continue
+		}
+		if c == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && s[j] >= 0x20 && s[j] <= 0x3f {
+				j++
+			}
+			if j < len(s) && s[j] >= 0x40 && s[j] <= 0x7e {
+				i = j + 1
+				continue
+			}
+		}
+		return 0, false
+	}
+	return w, true
+}
+
+func singleLineWidth(s string) int {
+	if w, ok := ansiASCIIWidth(s); ok {
+		return w
+	}
+	return ansi.StringWidth(s)
+}
+
 // terminalText makes untrusted text inert before it is combined with the
 // application's own terminal styling. ANSI-aware layout helpers deliberately
 // preserve escape sequences, so network metadata must cross this boundary
 // first.
 func terminalText(value string) string {
+	printableASCII := true
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c < 0x20 || c > 0x7e {
+			printableASCII = false
+			break
+		}
+	}
+	if printableASCII {
+		return value
+	}
 	value = ansi.Strip(value)
 	return strings.Map(func(r rune) rune {
 		switch {
@@ -304,6 +360,23 @@ func (m *Model) toggleSettingsPane() {
 // the list looks like a fragmented mixtape and headers add noise.
 const minTracksPerAlbum = 3.0
 
+// tracksHaveAlbumCohesion reports whether tracks average at least
+// minTracksPerAlbum tracks in each contiguous album run.
+func tracksHaveAlbumCohesion(tracks []playlist.Track) bool {
+	if len(tracks) == 0 {
+		return false
+	}
+	segments := 0
+	lastAlbum := ""
+	for i, t := range tracks {
+		if i == 0 || t.Album != lastAlbum {
+			segments++
+		}
+		lastAlbum = t.Album
+	}
+	return float64(len(tracks))/float64(segments) >= minTracksPerAlbum
+}
+
 // setHeaderStateFromTracks resets the running counters and re-runs the
 // cohesion heuristic. A fresh load also clears any manual override.
 func (m *Model) setHeaderStateFromTracks(tracks []playlist.Track) {
@@ -507,8 +580,12 @@ func fillSeparator(line string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	if w := lipgloss.Width(line); w < width {
+	w := lipgloss.Width(line)
+	if w < width {
 		return line + dimStyle.Render(strings.Repeat("─", width-w))
+	}
+	if w == width {
+		return line
 	}
 	return ansi.Truncate(line, width, "")
 }
@@ -542,7 +619,11 @@ func (m Model) navScrollItems(total int, labelFn func(int) string) []string {
 
 	if useFilter {
 		for j := scroll; j < len(m.navBrowser.searchIdx) && rendered < maxVisible; j++ {
-			label := terminalText(labelFn(m.navBrowser.searchIdx[j]))
+			idx := m.navBrowser.searchIdx[j]
+			if idx < 0 || idx >= total {
+				continue
+			}
+			label := terminalText(labelFn(idx))
 			lines = append(lines, cursorLine(label, j == m.navBrowser.cursor))
 			rendered++
 		}

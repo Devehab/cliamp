@@ -22,6 +22,7 @@ func (m *Model) openProviderSearchWith(prov playlist.Provider) {
 	if _, ok := prov.(provider.Searcher); ok {
 		m.cancelSearchOverlayRequest()
 		nextRequest(&m.requests.searchOverlay)
+		nextRequest(&m.requests.searchOverlayAlbum)
 		nextRequest(&m.requests.searchOverlayLists)
 		nextRequest(&m.requests.searchOverlayMutation)
 		m.searchOverlay = searchOverlayState{
@@ -101,8 +102,12 @@ func (m *Model) handleProvSearchKey(msg tea.KeyPressMsg) tea.Cmd {
 	case tea.KeyEscape:
 		m.provSearch.active = false
 	case tea.KeyEnter:
-		if len(m.provSearch.results) > 0 && !m.provPane.loading {
+		if len(m.provSearch.results) > 0 && !m.provPane.loading &&
+			m.provSearch.cursor >= 0 && m.provSearch.cursor < len(m.provSearch.results) {
 			idx := m.provSearch.results[m.provSearch.cursor]
+			if idx < 0 || idx >= len(m.provPane.lists) {
+				return nil
+			}
 			m.provPane.cursor = idx
 			m.providerMaybeAdjustScroll()
 			m.provSearch.active = false
@@ -367,13 +372,17 @@ func (m *Model) handleNetSearchResultsKey(msg tea.KeyPressMsg) tea.Cmd {
 	case "a":
 		if count > 0 && !m.netSearch.loading {
 			track := m.netSearch.results[m.netSearch.cursor]
-			m.closeNetSearch()
+			if !m.keepSearchOpen {
+				m.closeNetSearch()
+			}
 			return m.appendTrack(track)
 		}
 	case "q":
 		if count > 0 && !m.netSearch.loading {
 			track := m.netSearch.results[m.netSearch.cursor]
-			m.closeNetSearch()
+			if !m.keepSearchOpen {
+				m.closeNetSearch()
+			}
 			return m.queueTrackNext(track)
 		}
 	case "f":

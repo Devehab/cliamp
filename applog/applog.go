@@ -66,10 +66,10 @@ func init() {
 // level, and returns a close func. Calling Init twice closes the previous
 // file before swapping handlers.
 func Init(path string, level Level) (func() error, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create log dir: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open log file: %w", err)
 	}
@@ -88,13 +88,12 @@ func Init(path string, level Level) (func() error, error) {
 	return func() error {
 		mu.Lock()
 		defer mu.Unlock()
-		if currentFile == nil {
+		if currentFile != f {
 			return nil
 		}
-		err := currentFile.Close()
 		currentFile = nil
 		logger.Store(slog.New(slog.NewTextHandler(io.Discard, nil)))
-		return err
+		return f.Close()
 	}, nil
 }
 

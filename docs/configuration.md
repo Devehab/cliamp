@@ -16,7 +16,7 @@ cliamp searches for its config directory in this order:
 
 - `CLIAMP_CONFIG_DIR`
 - `XDG_CONFIG_HOME/cliamp`
-- On Windows, `%APPDATA%\cliamp`, unless `HOME` names a directory other than the profile directory. If `%APPDATA%\cliamp` has no `config.toml` and `HOME/.config/cliamp` has one, cliamp keeps the existing directory.
+- On Windows, `%APPDATA%\cliamp`, unless `HOME` names a directory other than the profile directory. If `%APPDATA%\cliamp` has no persisted config or resources yet and `HOME/.config/cliamp` does, cliamp keeps the existing directory.
 - `HOME/.config/cliamp`
 
 The examples below use `~/.config/cliamp`. On Windows, use `%APPDATA%\cliamp` unless you set a custom `HOME`.
@@ -78,7 +78,7 @@ eq = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 # Mirror draws tapered Braille bars around a persistent horizontal center axis.
 # ClassicPeak uses smooth bars and floating peak caps, with sampling aligned
 # to audible playback and adaptive redraws for smooth motion.
-# ClassicLED redraws at 30 FPS during playback, like the Winamp LED meter.
+# ClassicLED updates its LED physics at 30 Hz during playback, like the Winamp LED meter.
 # Neighboring bands are averaged into each bar.
 # YinYang koi chase each other across a wide strip, leaving on the right and
 # coming back on the left. Taller panels have them circle a lily pad whose
@@ -120,6 +120,9 @@ expanded = false
 # Close the Settings pane beside the playlist (Ctrl+B toggles and saves).
 hide_settings_pane = false
 
+# Keep the Ctrl+F search results open after q (queue next) or a (append).
+keep_search_open = false
+
 # Show highlighted-playlist metadata below Settings (Ctrl+I toggles and saves).
 show_metadata = false
 
@@ -130,6 +133,12 @@ padding_vertical = 1
 
 # UI theme name (see available themes in ~/.config/cliamp/themes/)
 theme = "Tokyo Night"
+
+# Start playing the first track automatically on launch (default: false)
+auto_play = false
+
+# Synced lyrics drift adjustment in milliseconds (-10000 to 10000, default: 0)
+lyrics_offset_ms = 0
 
 # Log level: "debug", "info", "warn", or "error" (default "info")
 # Logs are written to ~/.config/cliamp/cliamp.log
@@ -205,6 +214,12 @@ bar comes back the way you left it. Use `cliamp --no-help-bar` to hide it for
 one session, or `cliamp --help-bar` to show it despite this setting. Simplified
 mode draws neither the hint bar nor a playlist, so it is unaffected by this
 setting.
+
+`keep_search_open = true` keeps the `Ctrl+F` search results open after `q`
+(queue next) or `a` (append), with the same query and cursor, so you can queue
+several results without searching again. This covers provider search and the
+YouTube or SoundCloud search. The status line confirms each added track.
+`Enter` still plays the selected result and closes the search.
 
 `expanded = true` starts with the playlist at the expanded height, so the list
 gets every body row the terminal has left instead of the shorter default, and

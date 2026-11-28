@@ -118,6 +118,7 @@ In the global album list, press `s` to cycle through sort modes:
 | `starred` | Starred / favourited |
 | `byYear` | Chronological by release year |
 | `byGenre` | Grouped by genre |
+| `random` | Random |
 
 Cliamp saves the selected sort as `browse_sort` in the `[navidrome]` section of `~/.config/cliamp/config.toml`. It restores the sort at the next start.
 
@@ -151,6 +152,15 @@ format = "raw"
 ```
 
 Other values, such as `"mp3"`, `"aac"`, or `"opus"`, are sent as the requested format, but transcoding configured for the player in Navidrome takes precedence. Only `"raw"` bypasses that server setting. Format values are case-insensitive; surrounding whitespace is ignored.
+
+## Scrobbling
+
+Navidrome scrobbling is enabled by default. To disable now-playing and scrobble reports for Navidrome, add `scrobble = false` to your `[navidrome]` section in `~/.config/cliamp/config.toml`:
+
+```toml
+[navidrome]
+scrobble = false
+```
 
 ## Requirements
 

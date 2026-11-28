@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -893,6 +894,36 @@ func TestOverridesApplyLowPower(t *testing.T) {
 	}
 }
 
+func TestOverridesNoLowPowerAndVisualizerWithConfigLowPower(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLIAMP_CONFIG_DIR", dir)
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("visualizer = \"Wave\"\nlow_power = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.LowPower || cfg.Visualizer != "none" {
+		t.Fatalf("Load() = (LowPower=%v, Visualizer=%q), want (true, \"none\")", cfg.LowPower, cfg.Visualizer)
+	}
+
+	noLowPower := false
+	cfgNoLP := cfg
+	Overrides{LowPower: &noLowPower}.Apply(&cfgNoLP)
+	if cfgNoLP.LowPower || cfgNoLP.Visualizer != "Wave" {
+		t.Fatalf("--no-low-power produced (LowPower=%v, Visualizer=%q), want (false, \"Wave\")", cfgNoLP.LowPower, cfgNoLP.Visualizer)
+	}
+
+	vis := "Spectrum"
+	cfgVis := cfg
+	Overrides{Visualizer: &vis}.Apply(&cfgVis)
+	if cfgVis.Visualizer != "Spectrum" {
+		t.Fatalf("--visualizer Spectrum with low_power=true produced Visualizer=%q, want \"Spectrum\"", cfgVis.Visualizer)
+	}
+}
+
 // Mock player for ApplyPlayer tests
 type mockPlayer struct {
 	volumeMin float64
@@ -1110,6 +1141,97 @@ func TestLoadPluginKeysThatCliampReads(t *testing.T) {
 			cfg := loadConfigText(t, tt.body)
 			if got := cfg.Plugins[tt.plugin][tt.key]; got != tt.want {
 				t.Errorf("Plugins[%q][%q] = %q, want %q", tt.plugin, tt.key, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalSectionPreservesPluginNameCase(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"navidrome", "navidrome"},
+		{"Navidrome", "navidrome"},
+		{"YT", "ytmusic"},
+		{"YouTube", "ytmusic"},
+		{"Plugins", "plugins"},
+		{"plugins.MyPlugin", "plugins.MyPlugin"},
+		{"PLUGINS.MyPlugin", "plugins.MyPlugin"},
+		{"Plugins.Camel.Sub", "plugins.Camel.Sub"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := canonicalSection(tt.in); got != tt.want {
+				t.Errorf("canonicalSection(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+
+	cfg := loadConfigText(t, "[Plugins.MyPlugin]\ntoken = \"abc\"\nenabled = True\n")
+	if got := cfg.Plugins["MyPlugin"]["token"]; got != "abc" {
+		t.Errorf("Plugins[\"MyPlugin\"][\"token\"] = %q, want abc", got)
+	}
+	if got := cfg.Plugins["MyPlugin"]["enabled"]; got != "true" {
+		t.Errorf("Plugins[\"MyPlugin\"][\"enabled\"] = %q, want true", got)
+	}
+	if _, exists := cfg.Plugins["myplugin"]; exists {
+		t.Error("plugin section key was lowercased unexpectedly")
+	}
+}
+
+func TestClampResetsNonFiniteValues(t *testing.T) {
+	tests := []struct {
+		name      string
+		volumeMin float64
+		volume    float64
+		speed     float64
+		wantMin   float64
+		wantVol   float64
+		wantSpeed float64
+	}{
+		{name: "all NaN", volumeMin: math.NaN(), volume: math.NaN(), speed: math.NaN(), wantMin: -50, wantVol: 0, wantSpeed: 1.0},
+		{name: "all +Inf", volumeMin: math.Inf(1), volume: math.Inf(1), speed: math.Inf(1), wantMin: -50, wantVol: 0, wantSpeed: 1.0},
+		{name: "all -Inf", volumeMin: math.Inf(-1), volume: math.Inf(-1), speed: math.Inf(-1), wantMin: -50, wantVol: 0, wantSpeed: 1.0},
+		{name: "only VolumeMin NaN keeps valid Volume", volumeMin: math.NaN(), volume: -12, speed: 1.5, wantMin: -50, wantVol: -12, wantSpeed: 1.5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.VolumeMin = tt.volumeMin
+			cfg.Volume = tt.volume
+			cfg.Speed = tt.speed
+			cfg.clamp()
+			if cfg.VolumeMin != tt.wantMin {
+				t.Errorf("VolumeMin = %v, want %v", cfg.VolumeMin, tt.wantMin)
+			}
+			if cfg.Volume != tt.wantVol {
+				t.Errorf("Volume = %v, want %v", cfg.Volume, tt.wantVol)
+			}
+			if cfg.Speed != tt.wantSpeed {
+				t.Errorf("Speed = %v, want %v", cfg.Speed, tt.wantSpeed)
+			}
+		})
+	}
+}
+
+func TestOverridesApplyResetsNonFiniteVolume(t *testing.T) {
+	tests := []struct {
+		name string
+		vol  float64
+	}{
+		{name: "NaN", vol: math.NaN()},
+		{name: "+Inf", vol: math.Inf(1)},
+		{name: "-Inf", vol: math.Inf(-1)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.Volume = -12
+			v := tt.vol
+			Overrides{Volume: &v}.Apply(&cfg)
+			if cfg.Volume != 0 {
+				t.Errorf("Volume = %v, want default 0", cfg.Volume)
 			}
 		})
 	}

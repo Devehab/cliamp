@@ -9,12 +9,15 @@ import (
 	"time"
 
 	"github.com/bjarneo/cliamp/internal/appdir"
+	"github.com/bjarneo/cliamp/internal/fileutil"
 
 	"google.golang.org/api/youtube/v3"
 )
 
 // musicCategoryID is the YouTube video category for Music.
 const musicCategoryID = "10"
+
+var classificationMu sync.Mutex
 
 // classificationCache maps playlist ID → true if the playlist is music.
 type classificationCache struct {
@@ -47,13 +50,20 @@ func loadClassification(scope string) map[string]bool {
 	return cache.Music
 }
 
-// saveClassification writes playlist classifications to disk.
+// saveClassification writes playlist classifications atomically to disk.
 func saveClassification(scope string, music map[string]bool) {
-	cache := classificationCache{Scope: scope, Music: music}
-	data, _ := json.MarshalIndent(cache, "", "  ")
 	path := classificationCachePath()
-	os.MkdirAll(filepath.Dir(path), 0o700)
-	os.WriteFile(path, data, 0o600)
+	if path == "" {
+		return
+	}
+	cache := classificationCache{Scope: scope, Music: music}
+	data, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return
+	}
+	classificationMu.Lock()
+	defer classificationMu.Unlock()
+	_ = fileutil.WriteFileAtomic(path, data, 0o600)
 }
 
 // classifyPlaylists determines which playlists contain music content by
@@ -114,13 +124,16 @@ func classifyPlaylists(ctx context.Context, svc *youtube.Service, playlists []pl
 	wg.Wait()
 	close(sampleCh)
 
-	// Collect video IDs for batch category lookup.
-	videoToPlaylist := make(map[string]string) // videoID → playlistID
+	// Collect video IDs for batch category lookup. Multiple playlists can start
+	// with the same video ID, so map each video ID to all playlists sampling it.
+	videoToPlaylists := make(map[string][]string) // videoID → []playlistID
 	var videoIDs []string
 	for s := range sampleCh {
 		if s.videoID != "" {
-			videoToPlaylist[s.videoID] = s.playlistID
-			videoIDs = append(videoIDs, s.videoID)
+			if _, seen := videoToPlaylists[s.videoID]; !seen {
+				videoIDs = append(videoIDs, s.videoID)
+			}
+			videoToPlaylists[s.videoID] = append(videoToPlaylists[s.videoID], s.playlistID)
 		} else {
 			// No video found — default to non-music.
 			cached[s.playlistID] = false
@@ -139,7 +152,7 @@ func classifyPlaylists(ctx context.Context, svc *youtube.Service, playlists []pl
 		if err != nil {
 			// On error, default unclassified to non-music.
 			for _, vid := range batch {
-				if plID, ok := videoToPlaylist[vid]; ok {
+				for _, plID := range videoToPlaylists[vid] {
 					cached[plID] = false
 				}
 			}
@@ -147,8 +160,10 @@ func classifyPlaylists(ctx context.Context, svc *youtube.Service, playlists []pl
 		}
 
 		for _, v := range vResp.Items {
-			plID := videoToPlaylist[v.Id]
-			cached[plID] = (v.Snippet.CategoryId == musicCategoryID)
+			isMusic := v.Snippet.CategoryId == musicCategoryID
+			for _, plID := range videoToPlaylists[v.Id] {
+				cached[plID] = isMusic
+			}
 		}
 	}
 

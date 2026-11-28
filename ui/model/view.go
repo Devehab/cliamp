@@ -2,7 +2,6 @@ package model
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 	"time"
 
@@ -264,10 +263,14 @@ func (m Model) View() tea.View {
 		content = strings.Join(m.mainSections(body, true, contentFirst), "\n")
 	}
 
-	// Every screen now renders within the main frame, so frame and center
-	// uniformly.
-	rendered := m.centerFrame(m.layout.frameStyle().Render(content))
-	rendered = ui.FitRect(rendered, m.layout.frameWidth, max(1, m.height))
+	// Fast path for pure fullscreen visualizer: the visualizer produces exact
+	// frameWidth x height output with zero padding.
+	var rendered string
+	if screen == screenFullVisualizer && m.pureVis && m.layout.paddingH == 0 && m.layout.paddingV == 0 && m.width == m.layout.frameWidth && m.height > 0 && m.isSingleBuiltinVisPane() {
+		rendered = content
+	} else {
+		rendered = m.renderFramed(content)
+	}
 
 	if box := m.renderLuaSelect(); box != "" {
 		rendered = overlayCentered(rendered, box, m.layout.frameWidth, m.height)
@@ -279,7 +282,7 @@ func (m Model) View() tea.View {
 	}
 	view.AltScreen = true
 	view.KeyboardEnhancements = m.keyboardEnhancements()
-	view.WindowTitle = currentTerminalTitle(m.termTitle, m.width, m.terminalTitleValues())
+	view.WindowTitle = m.cachedWindowTitle()
 	return view
 }
 
@@ -471,20 +474,23 @@ func trackInfoName(track playlist.Track, streamTitle string) string {
 		return terminalText(streamTitle)
 	}
 
-	name := trackViewName(track)
+	var name string
 	if track.Meta(provider.MetaPodcastFeed) != "" {
 		name = track.DisplayName()
 		if track.Restricted {
 			name = strings.TrimSpace(name) + restrictedViewSuffix
 		}
+		name = terminalText(name)
+	} else {
+		name = trackViewName(track)
 	}
 	if name == "" {
 		name = "No track loaded"
 	}
 	if track.Album != "" {
-		name += " · " + track.Album
+		name += " · " + terminalText(track.Album)
 	}
-	return terminalText(name)
+	return name
 }
 
 // scrollTrackName returns the width-cell window of name at the given tick.
@@ -578,23 +584,95 @@ func (m Model) renderCompactSource() string {
 	return m.settingsSource(m.layout.panelWidth)
 }
 
-// centerFrame centers a pre-rendered frame in the terminal.
-func (m Model) centerFrame(frame string) string {
-	frameW := lipgloss.Width(frame)
-	frameH := lipgloss.Height(frame)
-	padLeft := max(0, (m.width-frameW)/2)
-	padTop := max(0, (m.height-frameH)/2)
+// renderFramed pads, centers, and clips content in one pass.
+func (m Model) renderFramed(content string) string {
+	frameW := m.layout.frameWidth
+	maxH := max(1, m.height)
+	if frameW <= 0 {
+		return ""
+	}
+	padH := m.layout.paddingH
+	padV := m.layout.paddingV
+	panelW := m.layout.panelWidth
+	if panelW <= 0 {
+		panelW = max(1, frameW-2*padH)
+	}
 
-	if padLeft == 0 {
-		return strings.Repeat("\n", padTop) + frame
+	contentLines := strings.Count(content, "\n") + 1
+	frameH := contentLines + 2*padV
+	padTop := max(0, (m.height-frameH)/2)
+	padLeft := 0
+	if m.width > frameW {
+		padLeft = (m.width - frameW) / 2
 	}
-	// Indent every line by padLeft spaces.
-	prefix := strings.Repeat(" ", padLeft)
-	lines := strings.Split(frame, "\n")
-	for i, l := range lines {
-		lines[i] = prefix + l
+	leftIndent := padLeft + padH
+	maxContentW := min(panelW, max(0, frameW-leftIndent))
+
+	var b strings.Builder
+	b.Grow(len(content) + (contentLines+2*padV)*(leftIndent+1) + padTop)
+
+	written := 0
+	writeLine := func(s string) bool {
+		if written >= maxH {
+			return false
+		}
+		if written > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(s)
+		written++
+		return true
 	}
-	return strings.Repeat("\n", padTop) + strings.Join(lines, "\n")
+
+	for range padTop {
+		if !writeLine("") {
+			return b.String()
+		}
+	}
+
+	// Non-empty frame padding rows separate the frame from centering blanks above it.
+	vPadRow := " "
+	if leftIndent > 0 && leftIndent <= frameW {
+		vPadRow = repeatSpaces(leftIndent)
+	}
+	for range padV {
+		if !writeLine(vPadRow) {
+			return b.String()
+		}
+	}
+
+	leftPad := ""
+	if leftIndent > 0 {
+		leftPad = repeatSpaces(min(leftIndent, frameW))
+	}
+
+	rest := content
+	for written < maxH {
+		line, after, hasNL := strings.Cut(rest, "\n")
+		if written > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(leftPad)
+		if maxContentW > 0 {
+			if len(line) > maxContentW && singleLineWidth(line) > maxContentW {
+				line = ansi.Truncate(line, maxContentW, "")
+			}
+			b.WriteString(line)
+		}
+		written++
+		if !hasNL {
+			break
+		}
+		rest = after
+	}
+
+	for range padV {
+		if !writeLine(vPadRow) {
+			break
+		}
+	}
+
+	return b.String()
 }
 
 func (m Model) renderTitle() string {
@@ -636,7 +714,7 @@ func (m Model) renderTimeStatus() string {
 	timeStr := fmt.Sprintf("%02d:%02d / %02d:%02d", posMin, posSec, durMin, durSec)
 
 	track, _ := m.currentPlaybackTrack()
-	if track.Stream && !m.player.Seekable() {
+	if track.Stream && !m.playerSeekable() {
 		timeStr = fmt.Sprintf("%02d:%02d / LIVE", posMin, posSec)
 	}
 
@@ -666,9 +744,20 @@ func (m Model) renderTimeStatus() string {
 	return left + strings.Repeat(" ", gap) + status
 }
 
+func (m Model) isSingleBuiltinVisPane() bool {
+	if m.panes == nil || m.panes.IsBuiltinOnly(ui.RegionVisualizer) {
+		return true
+	}
+	panes := m.panes.RegionPanes(ui.RegionVisualizer)
+	return len(panes) == 1 && panes[0].Pane == ui.PaneBuiltin && panes[0].Vis == ""
+}
+
 func (m Model) renderSpectrum() string {
 	if m.visualizerDisabled() {
 		return ""
+	}
+	if m.panes == nil || m.panes.IsBuiltinOnly(ui.RegionVisualizer) {
+		return m.vis.Render()
 	}
 	panes := m.regionPanes(ui.RegionVisualizer)
 	if len(panes) == 1 && panes[0].Pane == ui.PaneBuiltin {
@@ -680,11 +769,15 @@ func (m Model) renderSpectrum() string {
 	blocks := make([]string, len(panes))
 	for i, pane := range panes {
 		if pane.Vis != "" {
-			blocks[i] = m.renderPaneVis(pane.Vis, m.vis.Rows, widths[i])
+			blocks[i] = m.renderPaneVis(pane.Region, pane.Pane, pane.Vis, m.vis.Rows, widths[i])
 			continue
 		}
 		if pane.Pane == ui.PaneBuiltin {
-			blocks[i] = m.vis.RenderAt(widths[i])
+			if m.vis.Cols == widths[i] {
+				blocks[i] = m.vis.Render()
+			} else {
+				blocks[i] = m.vis.RenderAt(widths[i])
+			}
 			continue
 		}
 		blocks[i] = m.renderPluginPane(pane.Pane, m.vis.Rows, widths[i])
@@ -695,6 +788,9 @@ func (m Model) renderSpectrum() string {
 // renderFullVisualizer renders a full-screen view showing only the visualizer
 // with minimal track info and a seek bar.
 func (m Model) renderFullVisualizer() string {
+	if m.pureVis {
+		return m.renderSpectrum()
+	}
 	sections := []string{
 		m.fullVisTopLine(),
 		m.renderTimeStatus(),
@@ -747,7 +843,7 @@ func (m Model) renderSeekBar() string {
 		return seekDimStyle.Render(strings.Repeat(seekEmptyGlyph, m.layout.panelWidth))
 	}
 	// Show a static streaming bar for non-seekable streams with no known duration.
-	if !m.player.Seekable() && m.player.IsPlaying() && m.cachedDur == 0 {
+	if !m.playerSeekable() && m.player.IsPlaying() && m.cachedDur == 0 {
 		label := " STREAMING "
 		pad := m.layout.panelWidth - lipgloss.Width(label)
 		if pad < 0 {
@@ -775,9 +871,10 @@ func (m Model) renderSeekBar() string {
 	}
 
 	var b strings.Builder
-	b.WriteString(seekFillStyle.Render(strings.Repeat(seekFillGlyph, filled)))
-	b.WriteString(seekFillStyle.Render(seekHeadGlyph))
-	b.WriteString(seekDimStyle.Render(strings.Repeat(seekEmptyGlyph, w-filled-1)))
+	b.WriteString(seekFillStyle.Render(strings.Repeat(seekFillGlyph, filled) + seekHeadGlyph))
+	if empty := w - filled - 1; empty > 0 {
+		b.WriteString(seekDimStyle.Render(strings.Repeat(seekEmptyGlyph, empty)))
+	}
 	return b.String()
 }
 
@@ -930,7 +1027,39 @@ func (m Model) renderPlaylistHeader() string {
 	return m.renderPlaybackHeader()
 }
 
-// renderPlaybackHeader is also used to probe playback focus beneath overlays.
+const (
+	playbackHeaderLabel        = "── Playlist ── "
+	playbackHeaderFocusedLabel = "▸─ Playlist ── "
+	playbackHeaderTrailer      = " ──"
+	playbackHeaderBaseWidth    = 15 + 3
+	shuffleBadgeWidth          = len("[Shuffle]")
+)
+
+// playbackHeaderBadgeFits reports whether area fits in renderPlaybackHeader when
+// focused. It matches renderPlaybackHeader widths with no ANSI styles.
+func (m Model) playbackHeaderBadgeFits(area focusArea) bool {
+	if m.layout.twoColumn || m.playlist == nil {
+		return false
+	}
+	switch area {
+	case focusShuffle:
+		valueLen := len("Off")
+		if m.playlist.Shuffled() {
+			valueLen = len("On")
+		}
+		// "[Shuffle ▸ " has 11 cells, plus value and "]".
+		return playbackHeaderBaseWidth+12+valueLen <= m.layout.panelWidth
+	case focusRepeat:
+		// Unfocused "[Shuffle]", one space, then "[Repeat ▸ <mode>]".
+		repeatLen := len(m.playlist.Repeat().String())
+		// "[Repeat ▸ " has 10 cells, plus value and "]".
+		return playbackHeaderBaseWidth+shuffleBadgeWidth+1+11+repeatLen <= m.layout.panelWidth
+	default:
+		return false
+	}
+}
+
+// renderPlaybackHeader renders the playback header and its status badges.
 func (m Model) renderPlaybackHeader() string {
 	// Badges in display order. A narrow pane drops whole badges off the tail
 	// rather than letting the separator slice one mid-token.
@@ -973,15 +1102,14 @@ func (m Model) renderPlaybackHeader() string {
 	}
 
 	headerStyle := dimStyle
-	headerLabel := "── Playlist ── "
+	headerLabel := playbackHeaderLabel
 	if m.focus == focusPlaylist {
 		headerStyle = activeToggle
-		headerLabel = "▸─ Playlist ── "
+		headerLabel = playbackHeaderFocusedLabel
 	}
 
-	const trailer = " ──"
 	out := headerStyle.Render(headerLabel)
-	width := lipgloss.Width(headerLabel) + lipgloss.Width(trailer)
+	width := lipgloss.Width(headerLabel) + lipgloss.Width(playbackHeaderTrailer)
 	for i, badge := range badges {
 		w := lipgloss.Width(badge)
 		if i > 0 {
@@ -996,7 +1124,7 @@ func (m Model) renderPlaybackHeader() string {
 		out += badge
 		width += w
 	}
-	return out + dimStyle.Render(trailer)
+	return out + dimStyle.Render(playbackHeaderTrailer)
 }
 
 func (m Model) renderProviderList() string {
@@ -1052,6 +1180,9 @@ func (m Model) renderProviderList() string {
 				scroll := m.provSearch.scroll
 				for j := scroll; j < scroll+visible && j < len(m.provSearch.results); j++ {
 					idx := m.provSearch.results[j]
+					if idx < 0 || idx >= len(m.provPane.lists) {
+						continue
+					}
 					p := m.provPane.lists[idx]
 					prefix, style := m.providerRowStyle(p, j == m.provSearch.cursor)
 					lines = append(lines, style.Render(m.providerRowLabel(prefix, p)))
@@ -1068,11 +1199,10 @@ func (m Model) renderProviderList() string {
 			scroll = m.provPane.cursor
 		}
 
-		hasSections := !sectioned && slices.ContainsFunc(m.provPane.lists, func(p playlist.PlaylistInfo) bool {
-			return p.Section != ""
-		})
+		hasSections := !sectioned && m.provPane.listHasSections()
 
-		if sectioned {
+		if sectioned || hasSections {
+			scroll = max(scroll, m.provPane.cursor-visibleBudget+1)
 			for scroll < len(m.provPane.lists)-1 && m.providerRowsFromScroll(scroll, m.provPane.cursor) > visibleBudget {
 				scroll++
 			}
@@ -1229,21 +1359,74 @@ func (m Model) renderPlaylist() string {
 		return strings.Join(fitLines(lines, budget), "\n")
 	}
 
+	stateReporters := m.playbackStateReporters()
+	hasPlayed := hasPlaybackStateFrom(stateReporters)
 	currentIdx := m.playlist.Index()
+	isPlaying := m.isPlaying()
+	showHeaders := m.plShowsAlbumHeaders()
+	queueLen := m.playlist.QueueLen()
+
+	var cacheKey playlistCacheKey
+	cacheable := m.playlistCache != nil && !hasPlayed
+	if cacheable {
+		var radioFavRev uint64
+		if m.radioFavorites != nil {
+			radioFavRev = m.radioFavorites.Revision()
+		}
+		cacheKey = playlistCacheKey{
+			plPtr:            m.playlist,
+			playlistRev:      m.playlist.Revision(),
+			currentIdx:       currentIdx,
+			isPlaying:        isPlaying,
+			playbackDetached: m.playbackDetached,
+			plCursor:         m.plCursor,
+			plScroll:         m.plScroll,
+			focus:            m.focus,
+			showHeaders:      showHeaders,
+			panelWidth:       m.layout.panelWidth,
+			budget:           budget,
+			themeIdx:         m.themeIdx,
+			styleGen:         styleGen.Load(),
+			favGen:           m.favGen,
+			favSetLen:        len(m.favSet),
+			radioFavRev:      radioFavRev,
+			hasRadioFavs:     m.radioFavorites != nil,
+			savedPlaylist:    m.loadedPlaylist != "",
+			hasPlayed:        hasPlayed,
+			queueLen:         queueLen,
+		}
+		if m.playlistCache.valid && m.playlistCache.key == cacheKey {
+			return m.playlistCache.value
+		}
+	}
+
 	scroll := m.playlistScroll(budget)
 	windowStart := max(0, scroll-1)
-	indices, tracks := m.playlist.OrderWindow(windowStart, budget+1)
+	indices, tracks := m.playlist.OrderWindowShallow(windowStart, budget+1)
 	localScroll := scroll - windowStart
 
 	lines := make([]string, 0, budget)
-	numWidth := len(fmt.Sprintf("%d", trackCount))
-	cols := m.markerColumns()
-	var stateReporters []provider.PlaybackStateReporter
-	if cols.played {
-		stateReporters = m.playbackStateReporters()
+	numWidth := 1
+	for n := trackCount; n >= 10; n /= 10 {
+		numWidth++
 	}
+	cols := markerColumns{
+		queue:    queueLen > 0,
+		favorite: true,
+		played:   hasPlayed,
+	}
+	markersWidth := 3 // cursor, playback state, and trailing space
+	if cols.queue {
+		markersWidth++
+	}
+	if cols.favorite {
+		markersWidth++
+	}
+	if cols.played {
+		markersWidth++
+	}
+	linePrefixWidth := markersWidth + numWidth + 2 // 2 for ". "
 
-	showHeaders := m.plShowsAlbumHeaders()
 	for row := range m.playlistRows(tracks, localScroll, showHeaders) {
 		if row.Index < 0 {
 			if len(lines)+1 >= budget {
@@ -1260,7 +1443,7 @@ func (m Model) renderPlaylist() string {
 		i, t := indices[row.Index], row.Track
 		style := playlistItemStyle
 		selected := m.focus == focusPlaylist && i == m.plCursor
-		playing := !m.playbackDetached && i == currentIdx && m.player.IsPlaying()
+		playing := !m.playbackDetached && i == currentIdx && isPlaying
 		if playing {
 			style = playlistActiveStyle
 		}
@@ -1275,37 +1458,38 @@ func (m Model) renderPlaylist() string {
 				style = playlistUnavailableStyle
 			}
 		}
-		cursorMarker := " "
+
+		var rowBuf strings.Builder
 		if selected {
-			cursorMarker = ">"
+			rowBuf.WriteString(dimStyle.Render(">"))
+		} else {
+			rowBuf.WriteByte(' ')
 		}
 		// An unplayable track is never the playing one, so both share a cell.
-		stateMarker, stateStyle := " ", playlistActiveStyle
 		switch {
 		case t.Unplayable:
-			stateMarker, stateStyle = "!", playlistUnavailableStyle
+			rowBuf.WriteString(playlistUnavailableStyle.Render("!"))
 		case playing:
-			stateMarker = "▶"
+			rowBuf.WriteString(playlistActiveStyle.Render("▶"))
+		default:
+			rowBuf.WriteByte(' ')
 		}
-		markers := cursorMarker + stateMarker
-		styledMarkers := dimStyle.Render(cursorMarker) + stateStyle.Render(stateMarker)
 
-		queuePosition := m.playlist.QueuePosition(i)
+		queuePosition := 0
 		if cols.queue {
-			mark := " "
+			queuePosition = m.playlist.QueuePosition(i)
 			if queuePosition > 0 {
-				mark = "Q"
+				rowBuf.WriteString(activeToggle.Render("Q"))
+			} else {
+				rowBuf.WriteByte(' ')
 			}
-			markers += mark
-			styledMarkers += activeToggle.Render(mark)
 		}
 		if cols.favorite {
-			mark := " "
 			if m.playlistTrackFavorited(t) {
-				mark = favHeart
+				rowBuf.WriteString(favMarkerStyle.Render(favHeart))
+			} else {
+				rowBuf.WriteByte(' ')
 			}
-			markers += mark
-			styledMarkers += favMarkerStyle.Render(mark)
 		}
 		if cols.played {
 			mark, markStyle := " ", dimStyle
@@ -1317,62 +1501,71 @@ func (m Model) renderPlaylist() string {
 					mark, markStyle = partialMarker, dimStyle
 				}
 			}
-			markers += mark
-			styledMarkers += markStyle.Render(mark)
+			if mark != " " {
+				rowBuf.WriteString(markStyle.Render(mark))
+			} else {
+				rowBuf.WriteByte(' ')
+			}
 		}
-		markers += " "
-		styledMarkers += " "
+		rowBuf.WriteByte(' ')
 
 		name := trackViewName(t)
 		queueSuffix := ""
 		if queuePosition > 0 && m.layout.panelWidth >= 64 {
 			queueSuffix = fmt.Sprintf(" [Q%d]", queuePosition)
 		}
-		queueLen := lipgloss.Width(queueSuffix)
+		queueSuffixW := len(queueSuffix)
 		duration := formatTrackTime(t.DurationSecs)
-		durationLen := lipgloss.Width(duration)
+		durationLen := len(duration)
 		durationGap := 0
 		if duration != "" {
 			durationGap = durationLen + 1
 		}
 
-		linePrefixWidth := lipgloss.Width(markers) + numWidth + 2 // 2 for ". "
-
 		// State markers always occupy the same cells; low-priority queue position,
 		// album, and unavailable labels appear only when the terminal has room.
-		name = truncate(name, m.layout.panelWidth-linePrefixWidth-queueLen-durationGap)
+		name = truncate(name, m.layout.panelWidth-linePrefixWidth-queueSuffixW-durationGap)
 		// Truncate the album to fit whatever space remains after the track name.
 		albumSuffix := ""
 		nameLen := lipgloss.Width(name)
 		if t.Unplayable && m.layout.panelWidth >= 68 {
-			remaining := m.layout.panelWidth - linePrefixWidth - nameLen - queueLen - durationGap
+			remaining := m.layout.panelWidth - linePrefixWidth - nameLen - queueSuffixW - durationGap
 			if remaining >= len(" (unavailable)") {
-				albumSuffix = truncate(" (unavailable)", remaining)
+				albumSuffix = " (unavailable)"
 			}
 		} else if album := terminalText(t.Album); album != "" && !showHeaders && m.layout.panelWidth >= 56 {
-			remaining := m.layout.panelWidth - linePrefixWidth - nameLen - queueLen - durationGap - 3 // 3 = " · "
+			remaining := m.layout.panelWidth - linePrefixWidth - nameLen - queueSuffixW - durationGap - 3 // 3 = " · "
 			if remaining >= 4 {
 				albumSuffix = " · " + truncate(album, remaining)
 			}
 		}
 
 		numStr := fmt.Sprintf("%*d. ", numWidth, i+1)
-		line := styledMarkers + style.Render(numStr)
-		line += style.Render(name)
+		rowBuf.WriteString(style.Render(numStr + name))
+		albumLen := 0
 		if albumSuffix != "" {
-			line += dimStyle.Render(albumSuffix)
+			albumLen = lipgloss.Width(albumSuffix)
+			rowBuf.WriteString(dimStyle.Render(albumSuffix))
 		}
 		if queueSuffix != "" {
-			line += activeToggle.Render(queueSuffix)
+			rowBuf.WriteString(activeToggle.Render(queueSuffix))
 		}
 		if duration != "" {
-			padding := max(1, m.layout.panelWidth-lipgloss.Width(line)-durationLen)
-			line += strings.Repeat(" ", padding) + dimStyle.Render(duration)
+			lineWidth := linePrefixWidth + nameLen + albumLen + queueSuffixW
+			padding := max(1, m.layout.panelWidth-lineWidth-durationLen)
+			rowBuf.WriteString(repeatSpaces(padding))
+			rowBuf.WriteString(dimStyle.Render(duration))
 		}
-		lines = append(lines, line)
+		lines = append(lines, rowBuf.String())
 	}
 
-	return strings.Join(padLines(lines, budget, len(lines)), "\n")
+	out := strings.Join(padLines(lines, budget, len(lines)), "\n")
+	if cacheable {
+		m.playlistCache.key = cacheKey
+		m.playlistCache.value = out
+		m.playlistCache.valid = true
+	}
+	return out
 }
 
 // renderHelp renders the key hints of what owns the keys.
@@ -1416,6 +1609,15 @@ func (m Model) renderBottomStatus() string {
 		return left
 	}
 	return left + strings.Repeat(" ", gap) + right
+}
+
+// hasNetworkStats reports whether the active engine has stream byte counters.
+func (m Model) hasNetworkStats() bool {
+	if m.player == nil {
+		return false
+	}
+	downloaded, total := m.player.StreamBytes()
+	return downloaded > 0 || total > 0
 }
 
 // networkStatsText formats the live stream download counters, or "" for local

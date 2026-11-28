@@ -123,7 +123,7 @@ list.
 | `t` | Choose theme |
 | `v` | Cycle visualizer and save the choice in `config.toml` |
 | `Ctrl+V` | Pick visualizer from a list (live preview) |
-| `V` | Full screen visualizer. Inside it, `v` cycles modes and saves the choice, `<`/`>` change track, `+`/`-` change volume, and `t` hides the episode name, leaving only the bracketed source. `q` or `Esc` exits back to the player; `Ctrl+C` quits. |
+| `V` | Full screen visualizer. Inside it, `v` cycles modes and saves the choice, `<`/`>` change track, `+`/`-` change volume, and `t` hides the episode name, leaving only the bracketed source. `f` toggles a pure mode that draws only the visualizer, edge to edge: no track line, time, seek bar or frame padding. Useful on a dedicated screen or CRT. `q` or `Esc` exits back to the player; `Ctrl+C` quits. |
 | `Ctrl+H` | Toggle album headers |
 | `Ctrl+G` | Toggle the key-binding hint bar (remembered in `hide_help_bar`) |
 | `Ctrl+B` | Open/close the settings pane (remembered in `hide_settings_pane`) |
@@ -137,7 +137,7 @@ and `Esc` clears it.
 
 | Key | Action |
 |---|---|
-| `f` | Toggle the favorite ♥ on the selected track. Favorites appear in the "Favorites" virtual playlist, and cliamp also saves them on Spotify and Navidrome. For directory radio stations outside saved local playlists, toggle Radio Favorites from the browser or playback playlist, including country and genre results. In the country browser, pin the selected country or region. On a podcast show, subscribe or unsubscribe. |
+| `f` | Toggle the favorite ♥ on the selected track. Favorites appear in the "Favorites" virtual playlist, and cliamp also saves them on Spotify, Navidrome, and Yandex Music. For directory radio stations outside saved local playlists, toggle Radio Favorites from the browser or playback playlist, including country and genre results. In the country browser, pin the selected country or region. On a podcast show, subscribe or unsubscribe. |
 | `*` then `0`-`5` | Set the selected Navidrome track's rating. `0` clears it. The playing track shows `★N`, and Linux MPRIS reports the normalized rating. |
 | `Ctrl+F` | Search with the active provider (Podcasts, Spotify, Qobuz, Tidal, Bandcamp, Navidrome, Lyrion, Jellyfin, Emby, Plex, Audiobookshelf, Mixcloud, NetEase, SoundCloud, Yandex Music, Local), or search YouTube. Available in playlist and provider-browser views. The search line names the source. See [Search and filter modes](#search-and-filter-modes). |
 | `u` | Load URL (stream/playlist) |
@@ -180,7 +180,8 @@ preference remains saved for a wider layout. See
 | `a` | Toggle the queue (play next) |
 | `A` | Queue manager |
 | `c` | In the queue manager: clear the queue (press again to confirm when more than one track) |
-| `d` | In the queue manager: remove the highlighted track |
+| `d` | In the queue manager: open the audio device picker |
+| `x` | In the queue manager: remove the highlighted track |
 | `F` | Subscribed shows overlay (any provider that keeps subscriptions) |
 | `x` | Remove the highlighted track from the current playlist |
 | `p` | Playlist |
@@ -245,7 +246,8 @@ reordered, so `p` leaves them alone and reports them as skipped.
 | `D` | List: open the file browser to add `[[dir]]` sources to the selected playlist. Tracks: open the directory-sources screen. |
 | `a` | List: create a playlist. After naming it, the file browser opens at `~`. Use `Enter` to enter a directory, `Space` to select folders or files, `Enter` to confirm, or `Esc` to finish. Tracks: mark or unmark all visible tracks. |
 | `r` | List: rename the playlist (`Recently Played` cannot be renamed) |
-| `d` | List: delete playlist (confirms; `Recently Played` cannot be deleted). Tracks: remove marked tracks, or highlighted track when none are marked |
+| `d` | Open the audio device picker |
+| `x` | List: delete playlist (confirms; `Recently Played` cannot be deleted). Tracks: remove marked tracks, or highlighted track when none are marked |
 | `A` | List: append the selected playlist to the current one, keeping what is loaded. Tracks: append the marked tracks, or the highlighted one. |
 | `u` | Undo the last manager edit |
 | `←` `Backspace` `h` `q` | Tracks screen: go back to the list |
@@ -262,7 +264,8 @@ other key cancels. The Shift-letter keys do not switch providers then.
 |---|---|
 | `↑` `↓` / `j` `k` | Navigate directory sources |
 | `a` | Open the file browser to add a directory as a `[[dir]]` source |
-| `d` then `y` | Remove the selected source. `y` confirms; any other key cancels. |
+| `d` | Open the audio device picker |
+| `x` then `y` | Remove the selected source. `y` confirms; any other key cancels. |
 | `r` | Toggle `recursive` on the highlighted source |
 | `←` `Backspace` `h` `Esc` | Back to the tracks screen |
 
@@ -348,7 +351,7 @@ Navidrome, Podcasts, or Local Playlists:
 | `Ctrl+F` | Run the provider online or server search (Spotify, Navidrome, NetEase, and others). |
 | `Ctrl+R` | Refresh the provider: reload the currently open playlist or starting wave in place (e.g. a fresh Yandex "Моя волна" batch), or return to the playlist list. For Mixcloud, also clear the cached `/me/` identity. |
 | `p` | Open the playlist as an overlay (the Local source shows it directly; create, rename, delete, add dirs/tracks) |
-| `S` `P` `J` `E` `B` `Y` `C` `X` `M` `Q` `T` `K` `L` `R` `O` | Switch to that provider |
+| `S` `P` `J` `E` `B` `Y` `C` `X` `M` `Q` `T` `K` `U` `L` `R` `O` | Switch to that provider |
 | `N` | Open the browser of the provider on screen |
 | `Tab` | Leave the provider pane and focus Source, or the first visible playback control |
 | `Shift+Tab` | Leave the provider pane and focus the last visible playback control (Speed, or Repeat with Settings closed) |
@@ -376,8 +379,9 @@ search and the results list is open:
 | `↑` `↓` / `j` `k` / `Ctrl+N` `Ctrl+P` | Move cursor (single item) |
 | `Ctrl+U` `Ctrl+D` | Scroll results by page |
 | `Enter` | Play the selected track now |
-| `a` | Append the selected track to the playlist |
-| `q` | Queue the selected track to play next |
+| `a` | Append the selected track to the playlist (the results close unless `keep_search_open = true`) |
+| `q` | Queue the selected track to play next (the results close unless `keep_search_open = true`) |
+| `R` | (Provider search only) Replace the playlist with the selected track or album and play it |
 | `f` | Toggle the favorite ♥ on the selected track. On a podcast show, subscribe or unsubscribe. |
 | `p` | (Spotify only) Save the selected track to a Spotify playlist |
 | `Esc` `Backspace` | Back to the search input |
@@ -387,6 +391,11 @@ feed's episodes and starts the first; `a` appends them and starts the first if
 the playlist was empty or nothing is playing. `q` appends and queues the
 episodes newest first after any already queued tracks, starting queued
 playback if nothing is playing.
+
+On an album result, `Enter` appends the album's tracks to the playlist and
+starts the first one, so the playlist you built up stays. `R` replaces the
+playlist with the album instead. When the playlist is not empty, `R` asks first:
+`Enter` confirms and `Esc` cancels, because the replace cannot be undone.
 
 ## Fuzzy search
 

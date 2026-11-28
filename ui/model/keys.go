@@ -39,6 +39,8 @@ func (m *Model) quit() tea.Cmd {
 	m.flushPendingEQSave()
 	// Quit leaves the track that plays, as s does, so it can scrobble.
 	m.leaveTrack(m.player.PositionAndDuration())
+	m.cancelLyricsRequest()
+	m.cancelNavContext()
 	m.player.Close()
 	m.clearPlaybackTrack()
 	m.quitting = true
@@ -85,6 +87,9 @@ func (m *Model) providerMaybeAdjustScroll() {
 
 	// Provider lists can add radio-prefix or PlaylistInfo.Section headers. Keep
 	// the logical cursor visible in their rendered-row viewport.
+	if visible > 0 {
+		m.provPane.scroll = max(m.provPane.scroll, m.provPane.cursor-visible+1)
+	}
 	for m.provPane.scroll < total && m.providerRowsFromScroll(m.provPane.scroll, m.provPane.cursor) > visible {
 		m.provPane.scroll++
 	}
@@ -196,6 +201,9 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	msg = normalizeShiftedLetter(msg)
 
 	if m.luaSelect != nil {
+		if msg.String() == "ctrl+c" {
+			return m.quit()
+		}
 		m.handleLuaSelectKey(msg)
 		return nil
 	}
@@ -534,10 +542,12 @@ func (m *Model) handleMainKey(msg tea.KeyPressMsg) tea.Cmd {
 		return m.refreshActiveProvider(true)
 	case "esc", "backspace", "b":
 		if m.focus == focusPlaylist {
-			// Keep current expanded/collapsed height mode when switching focus.
-			m.focus = focusProvider
-			// The Local source has no provider pane list; show its manager.
-			m.ensureLocalManager()
+			if m.provider != nil {
+				// Keep current expanded/collapsed height mode when switching focus.
+				m.focus = focusProvider
+				// The Local source has no provider pane list; show its manager.
+				m.ensureLocalManager()
+			}
 		} else {
 			m.focus = m.previousMainFocus(m.focus)
 		}
@@ -755,10 +765,12 @@ func (m *Model) handleMainKey(msg tea.KeyPressMsg) tea.Cmd {
 		m.openThemePicker()
 
 	case "y":
-		m.lyrics.visible = !m.lyrics.visible
 		if m.lyrics.visible {
-			return m.retryLyrics()
+			m.closeLyrics()
+			return nil
 		}
+		m.lyrics.visible = true
+		return m.retryLyrics()
 
 	case "o":
 		m.openFileBrowser()
@@ -822,13 +834,7 @@ func (m *Model) handleMainKey(msg tea.KeyPressMsg) tea.Cmd {
 		}
 
 	case "d":
-		m.devicePicker.visible = true
-		m.devicePicker.cursor = 0
-		m.devicePicker.scroll = 0
-		if len(m.devicePicker.devices) == 0 {
-			m.devicePicker.loading = true
-			return listDevicesCmd()
-		}
+		return m.openDevicePicker()
 
 	case "]":
 		m.changeSpeed(0.25)
@@ -871,10 +877,7 @@ func (m *Model) handleInfoKey(msg tea.KeyPressMsg) tea.Cmd {
 func (m *Model) handleLyricsKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch msg.String() {
 	case "esc", "y", "q":
-		nextRequest(&m.requests.lyrics)
-		m.lyrics.loading = false
-		m.lyrics.query = ""
-		m.lyrics.visible = false
+		m.closeLyrics()
 	case "r":
 		return m.retryLyrics()
 	case "[":
@@ -931,6 +934,9 @@ func (m *Model) handleFullVisualizerKey(msg tea.KeyPressMsg) tea.Cmd {
 		m.adjustVolume(-1)
 	case "v":
 		_ = m.cycleVisualizer()
+	case "f":
+		m.pureVis = !m.pureVis
+		m.recomputeLayout()
 	case "t":
 		// Hide the episode name so the full-screen visualizer can be put on a
 		// shared screen without naming what is playing.
@@ -1061,8 +1067,9 @@ func (m *Model) handleURLInputKey(msg tea.KeyPressMsg) tea.Cmd {
 		input := strings.TrimSpace(m.urlInput.input)
 		if input != "" {
 			m.feedLoading = true
+			m.feedRequest = nextRequest(&m.requests.queue)
 			m.status.Activity("Loading URL...", statusTTLLong)
-			return resolveURLCmd(input, true)
+			return resolveURLCmdGen(input, true, m.feedRequest)
 		}
 		m.urlInput.active = true
 		m.urlInput.err = "Enter a stream, track, or playlist URL."
@@ -1070,6 +1077,19 @@ func (m *Model) handleURLInputKey(msg tea.KeyPressMsg) tea.Cmd {
 		if m.editText("url", &m.urlInput.input, msg) {
 			m.urlInput.err = ""
 		}
+	}
+	return nil
+}
+
+// openDevicePicker shows the audio device picker and lists the devices when
+// the list is empty. The picker renders above any open overlay.
+func (m *Model) openDevicePicker() tea.Cmd {
+	m.devicePicker.visible = true
+	m.devicePicker.cursor = 0
+	m.devicePicker.scroll = 0
+	if len(m.devicePicker.devices) == 0 {
+		m.devicePicker.loading = true
+		return listDevicesCmd(nextRequest(&m.requests.devices))
 	}
 	return nil
 }

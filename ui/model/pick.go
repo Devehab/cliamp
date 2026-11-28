@@ -12,6 +12,7 @@ import (
 type providerPickLoadedMsg struct {
 	dialogs  []playlist.PlaylistInfo
 	selected []playlist.PlaylistInfo
+	gen      uint64
 	err      error
 }
 
@@ -26,7 +27,7 @@ func (m *Model) startChatPicker() tea.Cmd {
 	m.provPane.pickPrev = m.provPane.lists
 	m.provPane.pickCur = m.provPane.cursor
 	m.provPane.pickScr = m.provPane.scroll
-	m.provPane.lists = nil
+	m.provPane.setLists(nil)
 	m.provPane.cursor, m.provPane.scroll = 0, 0
 	m.provPane.picking = true
 	m.provPane.pickLoad = true
@@ -35,23 +36,24 @@ func (m *Model) startChatPicker() tea.Cmd {
 	m.status.Show("Pick chats: space marks, enter saves, esc cancels.", statusTTLShort)
 
 	p := m.provider
+	gen := nextRequest(&m.requests.pick)
 	return func() tea.Msg {
 		dialogs, err := cf.Dialogs()
 		if err != nil {
-			return providerPickLoadedMsg{err: err}
+			return providerPickLoadedMsg{gen: gen, err: err}
 		}
 		var selected []playlist.PlaylistInfo
 		if len(cf.Chats()) > 0 {
 			selected, _ = p.Playlists()
 		}
-		return providerPickLoadedMsg{dialogs: dialogs, selected: selected}
+		return providerPickLoadedMsg{dialogs: dialogs, selected: selected, gen: gen}
 	}
 }
 
 // handleChatPickerLoaded fills the pane with the dialogs and marks the current
 // filter. A failure puts the pane back and reports the error.
 func (m *Model) handleChatPickerLoaded(msg providerPickLoadedMsg) {
-	if !m.provPane.picking {
+	if !m.provPane.picking || (msg.gen != 0 && msg.gen != m.requests.pick) {
 		return
 	}
 	m.provPane.pickLoad = false
@@ -61,7 +63,7 @@ func (m *Model) handleChatPickerLoaded(msg providerPickLoadedMsg) {
 		m.cancelChatPicker()
 		return
 	}
-	m.provPane.lists = msg.dialogs
+	m.provPane.setLists(msg.dialogs)
 	m.provPane.cursor, m.provPane.scroll = 0, 0
 	for _, info := range msg.selected {
 		m.provPane.picked[info.ID] = true
@@ -82,21 +84,25 @@ func (m *Model) handleChatPickerKey(msg tea.KeyPressMsg) tea.Cmd {
 	case "up", "k":
 		if m.provPane.cursor > 0 {
 			m.provPane.cursor--
-		} else {
+		} else if len(m.provPane.lists) > 0 {
 			m.provPane.cursor = len(m.provPane.lists) - 1
 		}
+		m.providerMaybeAdjustScroll()
 	case "down", "j":
 		if m.provPane.cursor < len(m.provPane.lists)-1 {
 			m.provPane.cursor++
 		} else {
 			m.provPane.cursor = 0
 		}
+		m.providerMaybeAdjustScroll()
 	case "home", "g":
 		m.provPane.cursor = 0
+		m.providerMaybeAdjustScroll()
 	case "end", "G":
 		if len(m.provPane.lists) > 0 {
 			m.provPane.cursor = len(m.provPane.lists) - 1
 		}
+		m.providerMaybeAdjustScroll()
 	case "space", " ":
 		if len(m.provPane.lists) > 0 {
 			id := m.provPane.lists[m.provPane.cursor].ID
@@ -119,7 +125,7 @@ func (m *Model) cancelChatPicker() {
 	m.provPane.picking = false
 	m.provPane.pickLoad = false
 	m.provPane.loading = false
-	m.provPane.lists = m.provPane.pickPrev
+	m.provPane.setLists(m.provPane.pickPrev)
 	m.provPane.cursor = m.provPane.pickCur
 	m.provPane.scroll = m.provPane.pickScr
 	m.provPane.picked = nil

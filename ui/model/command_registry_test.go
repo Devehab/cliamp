@@ -35,7 +35,7 @@ func TestCommandHelpKeepsEssentialHintsAtMinimumWidth(t *testing.T) {
 		{name: "playlist manager input", mode: commandModePlaylistManagerInput, keys: []string{"Esc", "Enter", "Ctrl+K"}},
 		{name: "playlist picker", mode: commandModePlaylistPicker, keys: []string{"Esc", "Enter", "Ctrl+K"}},
 		{name: "playlist picker input", mode: commandModePlaylistPickerInput, keys: []string{"Esc", "Enter", "Ctrl+K"}},
-		{name: "queue", mode: commandModeQueue, keys: []string{"Esc", "d", "Ctrl+K"}},
+		{name: "queue", mode: commandModeQueue, keys: []string{"Esc", "x", "Ctrl+K"}},
 		{name: "text input", mode: commandModeSearch, keys: []string{"Esc", "Enter", "Ctrl+K"}},
 		{name: "network search", mode: commandModeNetSearch, keys: []string{"Esc", "Enter", "Ctrl+K"}},
 		{name: "provider search", mode: commandModeSearchOverlay, keys: []string{"Esc", "Enter", "Ctrl+K"}},
@@ -93,16 +93,16 @@ func TestPreviousEQPresetRegistryEntry(t *testing.T) {
 				t.Fatalf("previous EQ preset command = %+v", command)
 			}
 			m := keybindingTestModel()
-			if !command.enabled(m) {
+			if !command.enabled(&m) {
 				t.Fatal("previous EQ preset command is disabled in a full model")
 			}
 			m.layout.tier = layoutMinimal
-			if command.enabled(m) {
+			if command.enabled(&m) {
 				t.Fatal("previous EQ preset command is enabled in minimal layout")
 			}
 			m.layout.tier = layoutFull
 			m.simplified = true
-			if command.enabled(m) {
+			if command.enabled(&m) {
 				t.Fatal("previous EQ preset command is enabled in simplified mode")
 			}
 			return

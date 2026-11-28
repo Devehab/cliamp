@@ -128,27 +128,35 @@ func (m *Model) loadFBDir() {
 		if strings.HasPrefix(name, ".") {
 			continue
 		}
+		fullPath := filepath.Join(m.fileBrowser.dir, name)
 		// Detect directories and directory-like entries.
 		dirType := "" // Name suffix for directories and some non-regular file types.
+		isAudio := false
 		if e.IsDir() {
 			dirType = "/"
 		} else if !e.Type().IsRegular() {
-			if e.Type()&os.ModeSymlink != 0 && !playlist.IsAudioFile(name) {
-				// Treat symlink as a directory unless it points to media file.
-				// os.DirEntry has no option to test the type of object symlink points to.
-				dirType = "@"
+			if e.Type()&os.ModeSymlink != 0 {
+				if info, statErr := os.Stat(fullPath); statErr == nil {
+					if info.IsDir() {
+						dirType = "@"
+					} else if info.Mode().IsRegular() {
+						isAudio = playlist.IsAudioFile(name)
+					}
+				}
 			} else if os.PathSeparator == '\\' && e.Type()&os.ModeIrregular != 0 {
 				// Try to support directory junctions on Windows (mklink /J).
 				// Go do not support such files, it treats them as os.ModeIrregular (?---------).
 				dirType = "?"
 			}
+		} else {
+			isAudio = playlist.IsAudioFile(name)
 		}
 		// Add entry to m.fileBrowser.entries or to files slice
 		if dirType != "" {
 			full := name + dirType
 			m.fileBrowser.entries = append(m.fileBrowser.entries, fbEntry{
 				name:  full,
-				path:  filepath.Join(m.fileBrowser.dir, name),
+				path:  fullPath,
 				isDir: true,
 			})
 		} else {
@@ -157,8 +165,8 @@ func (m *Model) loadFBDir() {
 			}
 			files = append(files, fbEntry{
 				name:    name,
-				path:    filepath.Join(m.fileBrowser.dir, name),
-				isAudio: playlist.IsAudioFile(name),
+				path:    fullPath,
+				isAudio: isAudio,
 			})
 		}
 	}
@@ -351,7 +359,7 @@ func (m *Model) handleFileBrowserKey(msg tea.KeyPressMsg) tea.Cmd {
 		}
 		if m.fileBrowser.cursor < m.fbCount() && m.fileBrowser.targetPlaylist == "" {
 			e := m.fbEntry(m.fileBrowser.cursor)
-			if e.isAudio || e.isDir {
+			if !e.isParent && (e.isAudio || e.isDir) {
 				m.fileBrowser.selected[e.path] = true
 				return m.fbConfirmToPlaylist()
 			}
@@ -387,7 +395,7 @@ func (m *Model) fbCommitAndRefresh() tea.Cmd {
 		// playlist counts now. A resolver command refreshes from its
 		// fbTracksResolvedMsg handler instead — batching a fetch here
 		// would read Playlists() before the tracks are written.
-		return m.fetchProviderPlaylists()
+		return m.refreshPaneAfterLocalWrite()
 	}
 	return cmd
 }
@@ -437,6 +445,9 @@ func (m *Model) fbConfirm(replace bool) tea.Cmd {
 		}
 	}
 	m.fileBrowser.visible = false
+	if len(paths) == 0 {
+		return nil
+	}
 
 	target := m.fileBrowser.targetPlaylist
 	if target != "" && plMgrVirtualPlaylistName(target) == "" {

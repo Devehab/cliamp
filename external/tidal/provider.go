@@ -41,6 +41,8 @@ const (
 // favoriteTracksLimit caps the synthetic Favorite Tracks list, matching Qobuz.
 const favoriteTracksLimit = 500
 
+const maxTrackCacheEntries = 1000
+
 // TrackURIPrefix is the custom URI scheme for Tidal tracks. Track paths are
 // "tidal://track/<id>"; the player resolves them to a fresh signed URL (or
 // DASH segment list) at play time via the SourceResolver registered in
@@ -116,8 +118,11 @@ func (p *TidalProvider) ensureClient() (*client, error) {
 	defer cancel()
 	c, err := newClientSilent(ctx)
 	if err != nil {
-		applog.Debug("tidal: silent auth failed, prompting sign-in: %v", err)
-		return nil, playlist.ErrNeedsAuth
+		if errors.Is(err, playlist.ErrNeedsAuth) || errors.Is(err, errAuthRevoked) {
+			applog.Debug("tidal: silent auth failed, prompting sign-in: %v", err)
+			return nil, playlist.ErrNeedsAuth
+		}
+		return nil, err
 	}
 
 	p.mu.Lock()
@@ -155,22 +160,20 @@ func (p *TidalProvider) Authenticate() error {
 	p.mu.Lock()
 	if p.authGen == gen {
 		p.authCancel = nil
+		if err == nil {
+			p.client = c
+		}
 	}
 	p.mu.Unlock()
 
-	if err != nil {
-		return err
-	}
-	p.mu.Lock()
-	p.client = c
-	p.mu.Unlock()
-	return nil
+	return err
 }
 
 // Close cancels any in-progress sign-in. Implements provider.Closer.
 func (p *TidalProvider) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.authGen++
 	if p.authCancel != nil {
 		p.authCancel()
 		p.authCancel = nil
@@ -305,6 +308,9 @@ func (p *TidalProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 	tracks := tracksFromAPI(apiTracks, nil)
 
 	p.mu.Lock()
+	if _, exists := p.trackCache[playlistID]; !exists && len(p.trackCache) >= maxTrackCacheEntries {
+		clear(p.trackCache)
+	}
 	p.trackCache[playlistID] = tracks
 	p.mu.Unlock()
 	return slices.Clone(tracks), nil

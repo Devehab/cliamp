@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -247,7 +248,7 @@ func upgradeCommand() *cli.Command {
 			&cli.BoolFlag{Name: "prerelease", Usage: "upgrade to the newest release, prereleases included"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			return upgrade.Run(version, c.Bool("prerelease"))
+			return upgrade.Run(buildVersion(), c.Bool("prerelease"))
 		},
 	}
 }
@@ -354,7 +355,7 @@ func protocolCommand() *cli.Command {
 		Usage: "register cliamp:// links with the desktop",
 		Description: "Makes cliamp the handler for cliamp:// links, so clicking one plays\n" +
 			"or queues its target. install.sh already registers the scheme; use\n" +
-			"these commands after a go install build, to point the scheme at a\n" +
+			"these commands after a source build, to point the scheme at a\n" +
 			"different binary, or to remove the registration.",
 		Commands: []*cli.Command{
 			{
@@ -849,7 +850,7 @@ func volumeCommand() *cli.Command {
 				return fmt.Errorf("usage: cliamp volume <dB>")
 			}
 			db, err := strconv.ParseFloat(c.Args().First(), 64)
-			if err != nil {
+			if err != nil || math.IsNaN(db) || math.IsInf(db, 0) {
 				return fmt.Errorf("invalid volume value %q", c.Args().First())
 			}
 			_, err = ipcSend("volume", ipc.Request{Value: db})
@@ -868,7 +869,7 @@ func seekCommand() *cli.Command {
 				return fmt.Errorf("usage: cliamp seek <seconds>")
 			}
 			secs, err := strconv.ParseFloat(c.Args().First(), 64)
-			if err != nil {
+			if err != nil || math.IsNaN(secs) || math.IsInf(secs, 0) {
 				return fmt.Errorf("invalid seek value %q", c.Args().First())
 			}
 			_, err = ipcSend("seek", ipc.Request{Value: secs})
@@ -1101,7 +1102,7 @@ func speedCommand() *cli.Command {
 				return fmt.Errorf("usage: cliamp speed <ratio>  (e.g. 1.0, 1.5, 0.75)")
 			}
 			ratio, err := strconv.ParseFloat(c.Args().First(), 64)
-			if err != nil {
+			if err != nil || math.IsNaN(ratio) || math.IsInf(ratio, 0) {
 				return fmt.Errorf("invalid speed %q", c.Args().First())
 			}
 			resp, err := ipcSend("speed", ipc.Request{Value: ratio})
@@ -1123,14 +1124,17 @@ func eqCommand() *cli.Command {
 			&cli.IntFlag{Name: "band", Usage: "EQ band index (0-9)", Value: -1, HideDefault: true},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			band := int(c.Int("band"))
-			if band >= 0 {
+			if c.IsSet("band") {
+				band := int(c.Int("band"))
+				if band < 0 {
+					return fmt.Errorf("invalid band index %d (must be 0-9)", band)
+				}
 				// Set a specific band.
 				if c.Args().Len() == 0 {
 					return fmt.Errorf("usage: cliamp eq --band N <dB>")
 				}
 				db, err := strconv.ParseFloat(c.Args().First(), 64)
-				if err != nil {
+				if err != nil || math.IsNaN(db) || math.IsInf(db, 0) {
 					return fmt.Errorf("invalid dB value %q", c.Args().First())
 				}
 				resp, err := ipcSend("eq", ipc.Request{Band: band, Value: db})

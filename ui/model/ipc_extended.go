@@ -18,6 +18,17 @@ import (
 	"github.com/bjarneo/cliamp/tracksave"
 )
 
+// maxIPCResponseTracks caps the number of rows returned in one IPC response
+// so large playlists stay inside the frame size limit.
+const maxIPCResponseTracks = 200
+
+func capIPCItems[T any](items []T) []T {
+	if len(items) > maxIPCResponseTracks {
+		return items[:maxIPCResponseTracks]
+	}
+	return items
+}
+
 // ipcLibraryRequest carries a provider or saved-playlist operation to
 // handleIPCLibrary. Reply receives the result of the job.
 type ipcLibraryRequest struct {
@@ -36,6 +47,8 @@ type ipcLibraryRequest struct {
 	Tracks   []ipc.TrackInfo
 	Context  context.Context
 	Reply    chan ipc.Response
+	Jobs     *ipc.JobStore
+	JobID    string
 }
 
 // ipcURLRequest carries url.load to handleIPCURL. Play starts the first
@@ -46,6 +59,8 @@ type ipcURLRequest struct {
 	Play    bool
 	Context context.Context
 	Reply   chan ipc.Response
+	Jobs    *ipc.JobStore
+	JobID   string
 }
 
 // ipcSaveRequest, ipcLyricsRequest and ipcHistoryRequest carry the save,
@@ -68,6 +83,7 @@ type ipcHistoryRequest struct {
 
 type ipcProviderLoadResult struct {
 	request  ipcLibraryRequest
+	gen      uint64
 	tracks   []playlist.Track
 	provider string // Name of the provider that served the tracks
 	loaded   string
@@ -101,7 +117,7 @@ type ipcFeedLoadResult struct {
 	feed     playlist.Track
 	jobs     *ipc.JobStore
 	jobID    string
-	revision uint64
+	revision *uint64
 	tracks   []playlist.Track
 	err      error
 }
@@ -116,37 +132,71 @@ func (m *Model) handleIPCURL(request ipcURLRequest) tea.Cmd {
 	}
 }
 
+func (m *Model) finishIPCJob(jobs *ipc.JobStore, jobID string, reply chan ipc.Response, resp ipc.Response) {
+	if jobs != nil && jobID != "" {
+		m.completeV2Job(jobs, jobID, resp)
+		return
+	}
+	if reply != nil {
+		reply <- resp
+	}
+}
+
+func (m *Model) failIPCJob(jobs *ipc.JobStore, jobID string, reply chan ipc.Response, v2Err *ipc.V2Error, detail string) {
+	if jobs != nil && jobID != "" {
+		v2Err.Detail = detail
+		m.failV2Job(jobs, jobID, v2Err)
+		return
+	}
+	if reply != nil {
+		reply <- ipc.Response{OK: false, Error: detail}
+	}
+}
+
 func (m *Model) handleIPCURLResult(result ipcURLLoadResult) tea.Cmd {
-	if result.request.Context != nil && result.request.Context.Err() != nil {
+	if result.request.Jobs != nil && result.request.JobID != "" {
+		ctx, ok := result.request.Jobs.Context(result.request.JobID)
+		if !ok || ctx.Err() != nil {
+			return nil
+		}
+	} else if result.request.Context != nil && result.request.Context.Err() != nil {
 		return nil
 	}
 	if result.err != nil {
-		result.request.Reply <- ipc.Response{OK: false, Error: result.err.Error()}
+		m.failIPCJob(result.request.Jobs, result.request.JobID, result.request.Reply, v2InternalError(), result.err.Error())
 		return nil
 	}
 	if len(result.tracks) == 0 {
-		result.request.Reply <- ipc.Response{OK: false, Error: "no tracks found at URL"}
+		m.failIPCJob(result.request.Jobs, result.request.JobID, result.request.Reply, v2InternalError(), "no tracks found at URL")
 		return nil
 	}
 	// A Play request jumps to the first newly added track, so a caller that
 	// asked to play a URL hears it even when something is already playing.
 	// Without it the tracks are appended and only start when the player is
 	// idle, which is the right default for a plain append.
-	wasStopped := !m.player.IsPlaying()
+	wasIdle := m.idleForNewTrack()
 	start := m.appendTracks(result.tracks...)
-	result.request.Reply <- ipc.Response{OK: true, Tracks: ipcTrackInfos(result.tracks, m.trackFavoriteLookup(true)), Total: len(result.tracks)}
+	var cmd tea.Cmd
 	if result.request.Play {
 		m.stopPlayback()
-		m.player.ClearPreload()
+		m.clearPreload()
 		m.playlist.SetIndex(start)
 		m.plCursor = start
 		m.adjustScroll()
-		return m.playCurrentTrack()
+		cmd = m.playCurrentTrack()
+	} else if wasIdle {
+		m.playlist.SetIndex(start)
+		m.plCursor = start
+		m.adjustScroll()
+		cmd = m.playCurrentTrack()
 	}
-	if wasStopped {
-		return m.playCurrentTrack()
+	resp := ipc.Response{
+		OK:     true,
+		Tracks: ipcTrackInfos(capIPCItems(result.tracks), m.trackFavoriteLookup(true)),
+		Total:  len(result.tracks),
 	}
-	return nil
+	m.finishIPCJob(result.request.Jobs, result.request.JobID, result.request.Reply, resp)
+	return cmd
 }
 
 func (m *Model) handleIPCSave(request ipcSaveRequest) tea.Cmd {
@@ -167,7 +217,7 @@ func (m *Model) handleIPCSave(request ipcSaveRequest) tea.Cmd {
 	}
 }
 
-func ipcFeedLoadCmd(ctx context.Context, op string, feed playlist.Track, jobs *ipc.JobStore, jobID string, revision uint64) tea.Cmd {
+func ipcFeedLoadCmd(ctx context.Context, op string, feed playlist.Track, jobs *ipc.JobStore, jobID string, revision *uint64) tea.Cmd {
 	return func() tea.Msg {
 		resolveCtx, cancel := context.WithTimeout(requestContext(ctx), 30*time.Second)
 		defer cancel()
@@ -197,7 +247,7 @@ func (m *Model) handleIPCFeedLoad(result ipcFeedLoadResult) tea.Cmd {
 		m.failV2Job(result.jobs, result.jobID, err)
 		return nil
 	}
-	if result.revision != 0 && result.revision != m.playlist.Revision() {
+	if result.revision != nil && *result.revision != m.playlist.Revision() {
 		m.failV2Job(result.jobs, result.jobID, v2ConflictError())
 		return nil
 	}
@@ -236,7 +286,7 @@ func (m *Model) handleIPCLibrary(request ipcLibraryRequest) tea.Cmd {
 
 	entry, ok := m.ipcProvider(request.Provider)
 	if !ok {
-		request.Reply <- ipc.Response{OK: false, Error: fmt.Sprintf("unknown provider %q", request.Provider)}
+		m.failIPCJob(request.Jobs, request.JobID, request.Reply, v2InternalError(), fmt.Sprintf("unknown provider %q", request.Provider))
 		return nil
 	}
 
@@ -377,7 +427,7 @@ func (m *Model) handleIPCLibrary(request ipcLibraryRequest) tea.Cmd {
 				request.Reply <- ipcResponseError(err)
 				return nil
 			}
-			request.Reply <- ipc.Response{OK: true, Playlists: items, Total: added}
+			request.Reply <- ipc.Response{OK: true, Playlists: capIPCItems(items), Total: added}
 			return nil
 		}
 	case "provider.tracks":
@@ -413,9 +463,10 @@ func (m *Model) handleIPCLibrary(request ipcLibraryRequest) tea.Cmd {
 		}
 	case "provider.load":
 		name := entry.Provider.Name()
+		gen := nextRequest(&m.ipcProviderLoadGen)
 		return func() tea.Msg {
 			tracks, err := entry.Provider.Tracks(request.Playlist)
-			return ipcProviderLoadResult{request: request, tracks: tracks, provider: name, loaded: request.Playlist, source: entry.Key + ":" + request.Playlist, start: request.Index, err: err}
+			return ipcProviderLoadResult{request: request, gen: gen, tracks: tracks, provider: name, loaded: request.Playlist, source: entry.Key + ":" + request.Playlist, start: request.Index, err: err}
 		}
 	case "provider.search":
 		favorite := m.trackFavoriteLookup(false)
@@ -424,7 +475,11 @@ func (m *Model) handleIPCLibrary(request ipcLibraryRequest) tea.Cmd {
 			if limit <= 0 || limit > 100 {
 				limit = 25
 			}
-			tracks, err := ipcSearchProvider(requestContext(request.Context), entry.Provider, request.Query, min(100, request.Offset+limit))
+			fetchLimit := 100
+			if request.Offset < 100 && request.Offset+limit < 100 {
+				fetchLimit = request.Offset + limit
+			}
+			tracks, err := ipcSearchProvider(requestContext(request.Context), entry.Provider, request.Query, fetchLimit)
 			if err != nil {
 				request.Reply <- ipc.Response{OK: false, Error: err.Error()}
 			} else {
@@ -500,20 +555,24 @@ func (m *Model) handleIPCLibrary(request ipcLibraryRequest) tea.Cmd {
 	case "provider.album_tracks", "provider.load_album":
 		loader, ok := entry.Provider.(provider.AlbumTrackLoader)
 		if !ok {
-			request.Reply <- ipc.Response{OK: false, Error: "provider does not support album tracks"}
+			m.failIPCJob(request.Jobs, request.JobID, request.Reply, v2InternalError(), "provider does not support album tracks")
 			return nil
 		}
 		favorite := m.trackFavoriteLookup(false)
 		name := entry.Provider.Name()
+		var gen uint64
+		if request.Op == "provider.load_album" {
+			gen = nextRequest(&m.ipcProviderLoadGen)
+		}
 		return func() tea.Msg {
 			tracks, err := loader.AlbumTracks(request.Album)
 			if request.Op == "provider.load_album" {
-				return ipcProviderLoadResult{request: request, tracks: tracks, provider: name, loaded: "album:" + request.Album, source: entry.Key + ":album:" + request.Album, err: err}
+				return ipcProviderLoadResult{request: request, gen: gen, tracks: tracks, provider: name, loaded: "album:" + request.Album, source: entry.Key + ":album:" + request.Album, err: err}
 			}
 			if err != nil {
 				request.Reply <- ipcResponseError(err)
 			} else {
-				page, total := ipcPage(tracks, request.Offset, request.Limit, 200)
+				page, total := ipcPage(tracks, request.Offset, request.Limit, maxIPCResponseTracks)
 				request.Reply <- ipc.Response{OK: true, Tracks: ipcTrackInfos(page, favorite), Total: total}
 			}
 			return nil
@@ -595,22 +654,34 @@ func ipcSearchProvider(ctx context.Context, source playlist.Provider, query stri
 }
 
 func (m *Model) handleIPCProviderLoad(result ipcProviderLoadResult) tea.Cmd {
-	if result.request.Context != nil && result.request.Context.Err() != nil {
+	if result.request.Jobs != nil && result.request.JobID != "" {
+		ctx, ok := result.request.Jobs.Context(result.request.JobID)
+		if !ok || ctx.Err() != nil {
+			return nil
+		}
+	} else if result.request.Context != nil && result.request.Context.Err() != nil {
+		return nil
+	}
+	if result.gen != m.ipcProviderLoadGen {
+		m.failIPCJob(result.request.Jobs, result.request.JobID, result.request.Reply, v2ConflictError(), "superseded by newer load")
 		return nil
 	}
 	if result.err != nil {
-		result.request.Reply <- ipc.Response{OK: false, Error: result.err.Error()}
+		m.failIPCJob(result.request.Jobs, result.request.JobID, result.request.Reply, v2InternalError(), result.err.Error())
 		return nil
 	}
 	// Index 0 still loads an empty list.
 	if result.start > 0 && result.start >= len(result.tracks) {
-		result.request.Reply <- ipc.Response{OK: false, Error: "track index out of range"}
+		m.failIPCJob(result.request.Jobs, result.request.JobID, result.request.Reply, v2InternalError(), "track index out of range")
 		return nil
 	}
 	// This replaces the queue wholesale, so retire any in-flight paged load:
 	// its later pages would otherwise still pass the generation guard and
 	// append onto the list loaded here.
 	m.retireTracksPaging()
+	if len(result.tracks) == 0 {
+		m.stopPlayback()
+	}
 	m.replacePlaylistAt(result.tracks, result.start)
 	m.setLoadedLocalPlaylist(result.provider, result.loaded)
 	if m.loadedPlaylist == "" {
@@ -618,8 +689,15 @@ func (m *Model) handleIPCProviderLoad(result ipcProviderLoadResult) tea.Cmd {
 	}
 	m.setHeaderStateFromTracks(result.tracks)
 	m.plCursor = result.start
-	result.request.Reply <- ipc.Response{OK: true, Tracks: ipcTrackInfos(result.tracks, m.trackFavoriteLookup(true)), Playlist: result.request.Playlist, Total: len(result.tracks)}
-	return m.playCurrentTrack()
+	cmd := m.playCurrentTrack()
+	resp := ipc.Response{
+		OK:       true,
+		Tracks:   ipcTrackInfos(capIPCItems(result.tracks), m.trackFavoriteLookup(true)),
+		Playlist: result.request.Playlist,
+		Total:    len(result.tracks),
+	}
+	m.finishIPCJob(result.request.Jobs, result.request.JobID, result.request.Reply, resp)
+	return cmd
 }
 
 // handleIPCPlaylistRenamed moves the loaded playlist to the new name when
@@ -678,19 +756,20 @@ func (m *Model) handleIPCLyrics(request ipcLyricsRequest) tea.Cmd {
 
 func (m *Model) handleIPCHistory(request ipcHistoryRequest) tea.Cmd {
 	favorite := m.trackFavoriteLookup(false)
+	store := m.historyStore
 	return func() tea.Msg {
-		if m.historyStore == nil {
+		if store == nil {
 			request.Reply <- ipc.Response{OK: true}
 			return nil
 		}
 		if request.Op == "history.clear" {
-			if err := m.historyStore.Clear(); err != nil {
+			if err := store.Clear(); err != nil {
 				request.Reply <- ipcResponseError(err)
 				return nil
 			}
 			return ipcHistoryClearedMsg{reply: request.Reply}
 		}
-		entries, err := m.historyStore.Recent(request.Limit)
+		entries, err := store.Recent(request.Limit)
 		if err != nil {
 			request.Reply <- ipc.Response{OK: false, Error: err.Error()}
 			return nil

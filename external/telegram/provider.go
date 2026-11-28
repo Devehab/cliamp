@@ -24,14 +24,17 @@ import (
 	tgclient "github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 )
 
 // Compile-time interface checks.
 var (
 	_ playlist.Provider          = (*Provider)(nil)
+	_ playlist.Refresher         = (*Provider)(nil)
 	_ provider.CustomStreamer    = (*Provider)(nil)
 	_ provider.TrackPager        = (*Provider)(nil)
 	_ provider.CodeAuthenticator = (*Provider)(nil)
+	_ provider.Closer            = (*Provider)(nil)
 )
 
 const (
@@ -75,10 +78,17 @@ type authRequest struct {
 // Provider lists the audio of one Telegram chat and streams its documents.
 type Provider struct {
 	cfg        config.TelegramConfig
+	ctx        context.Context
+	cancel     context.CancelFunc
+	runFn      func()
+	closeOnce  sync.Once
 	client     *tgclient.Client
 	api        *tg.Client
 	authReq    chan authRequest
-	mu         sync.Mutex // guards state and connectErr
+	mu         sync.Mutex // guards started, running, runDone, state, and connectErr
+	started    bool
+	running    bool
+	runDone    chan struct{}
 	state      provState
 	connectErr error
 	cacheDir   string
@@ -88,11 +98,9 @@ type Provider struct {
 	chatsCache map[string]playlist.PlaylistInfo
 }
 
-// NewFromConfig returns nil when [telegram] is not configured. It never
-// blocks: the connection comes up in the background and the first Playlists,
-// Tracks or stream call waits for it, so a slow or unreachable network does
-// not hold the interface back. Without a saved session the pane shows the
-// sign-in prompt and collects the code there (provider.CodeAuthenticator).
+// NewFromConfig returns nil when [telegram] is not configured. It starts no
+// network connection during startup. The first method call that needs Telegram
+// starts the background client so unused providers open no MTProto connection.
 func NewFromConfig(cfg config.TelegramConfig) *Provider {
 	if !cfg.IsSet() {
 		return nil
@@ -101,14 +109,96 @@ func NewFromConfig(cfg config.TelegramConfig) *Provider {
 	if err != nil {
 		cache = os.TempDir()
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	p := &Provider{
 		cfg:      cfg,
+		ctx:      ctx,
+		cancel:   cancel,
 		authReq:  make(chan authRequest),
 		cacheDir: filepath.Join(cache, "cliamp", "telegram"),
 		artCache: make(map[msgKey]string),
 	}
-	go p.run()
+	p.runFn = p.run
 	return p
+}
+
+// ensureStarted starts the background Telegram client once on first use, or
+// again after Refresh resets a failed connection.
+func (p *Provider) ensureStarted() {
+	if p.runFn == nil {
+		return
+	}
+	if p.ctx != nil && p.ctx.Err() != nil {
+		return
+	}
+	p.mu.Lock()
+	if p.started || p.running {
+		p.mu.Unlock()
+		return
+	}
+	p.started = true
+	p.running = true
+	done := make(chan struct{})
+	p.runDone = done
+	p.mu.Unlock()
+	go func() {
+		defer func() {
+			p.mu.Lock()
+			p.running = false
+			p.mu.Unlock()
+			close(done)
+		}()
+		p.runFn()
+	}()
+}
+
+// Refresh implements playlist.Refresher: it clears cached chat lookups and
+// allows a failed connection to reconnect on the next access.
+func (p *Provider) Refresh() {
+	p.chatsMu.Lock()
+	p.chatsCache = nil
+	p.chatsMu.Unlock()
+
+	p.mu.Lock()
+	if p.state != provFailed {
+		p.mu.Unlock()
+		return
+	}
+	done := p.runDone
+	p.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+	p.mu.Lock()
+	if p.state == provFailed && !p.running {
+		p.state = provConnecting
+		p.connectErr = nil
+		p.started = false
+	}
+	p.mu.Unlock()
+}
+
+// Close cancels the background Telegram client context.
+func (p *Provider) Close() {
+	p.closeOnce.Do(func() {
+		if p.cancel != nil {
+			p.cancel()
+		}
+	})
+}
+
+func (p *Provider) baseContext() context.Context {
+	if p.ctx != nil {
+		return p.ctx
+	}
+	return context.Background()
+}
+
+func (p *Provider) doneChan() <-chan struct{} {
+	if p.ctx != nil {
+		return p.ctx.Done()
+	}
+	return nil
 }
 
 func (p *Provider) sessionPath() string { return sessionPath(p.cfg.SessionFile) }
@@ -123,6 +213,7 @@ func (p *Provider) Chats() []string {
 // SetChats writes the filter into [telegram] and applies it in memory, so the
 // running pane follows without a restart. An empty list lists every dialog.
 func (p *Provider) SetChats(chats []string) error {
+	p.ensureStarted()
 	var kv []config.KeyValue
 	if len(chats) > 0 {
 		quoted := make([]string, 0, len(chats))
@@ -148,24 +239,33 @@ func (p *Provider) Prompt() string { return "Enter the code Telegram sent to you
 // with the code the user typed on the live connection. The pane calls it once
 // per attempt, so a rejected code can be corrected and repeated.
 func (p *Provider) Authenticate(code string) error {
+	p.ensureStarted()
 	if err := p.wait(); err != nil && !errors.Is(err, playlist.ErrNeedsAuth) {
 		return err
 	}
-	req := authRequest{result: make(chan error, 1)}
+	req := authRequest{code: code, result: make(chan error, 1)}
+	done := p.doneChan()
 	select {
 	case p.authReq <- req:
+	case <-done:
+		return errors.New("telegram: provider closed")
 	case <-time.After(5 * time.Second):
 		return errors.New("telegram: not connected, try again")
 	}
 	select {
 	case err := <-req.result:
 		return err
+	case <-done:
+		return errors.New("telegram: provider closed")
 	case <-time.After(loginWait):
 		return errors.New("telegram: sign in timed out")
 	}
 }
 
 func (p *Provider) run() {
+	if p.baseContext().Err() != nil {
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(p.sessionPath()), 0o700); err != nil {
 		p.setFailed(err)
 		return
@@ -173,17 +273,18 @@ func (p *Provider) run() {
 	p.client = tgclient.NewClient(p.cfg.AppID, p.cfg.AppHash, tgclient.Options{
 		SessionStorage: &session.FileStorage{Path: p.sessionPath()},
 	})
-	err := p.client.Run(context.Background(), func(ctx context.Context) error {
+	err := p.client.Run(p.baseContext(), func(ctx context.Context) error {
 		status, err := p.client.Auth().Status(ctx)
 		if err != nil {
 			p.setFailed(err)
 			return err
 		}
 		if !status.Authorized {
-			// Connected without a session: keep the connection open and let
-			// the provider pane drive the sign-in with the typed code.
-			p.setNeedsAuth()
-			return p.awaitSignIn(ctx)
+			// Connected without a session: send the login code once, then let
+			// the provider pane submit the typed code against that code hash.
+			return p.awaitSignIn(ctx, p.client.Auth(), func() {
+				p.api = p.client.API()
+			})
 		}
 		p.api = p.client.API()
 		p.setReady()
@@ -196,9 +297,41 @@ func (p *Provider) run() {
 	}
 }
 
-// awaitSignIn serves Authenticate requests on the live connection until one
-// code signs in, the client stops, or the channel closes.
-func (p *Provider) awaitSignIn(ctx context.Context) error {
+type tgAuthClient interface {
+	SendCode(ctx context.Context, phone string, options auth.SendCodeOptions) (tg.AuthSentCodeClass, error)
+	SignIn(ctx context.Context, phone, code, codeHash string) (*tg.AuthAuthorization, error)
+	Password(ctx context.Context, password string) (*tg.AuthAuthorization, error)
+}
+
+// awaitSignIn requests a verification code once, signals provNeedsAuth, and
+// serves Authenticate attempts on the live connection until one succeeds, the
+// client stops, or the channel closes.
+func (p *Provider) awaitSignIn(ctx context.Context, client tgAuthClient, onReady func()) error {
+	if p.cfg.Phone == "" {
+		return errors.New("telegram: [telegram] phone is required to sign in")
+	}
+	phone := normalizePhone(p.cfg.Phone)
+	sentCode, err := client.SendCode(ctx, phone, auth.SendCodeOptions{})
+	if err != nil {
+		return fmt.Errorf("telegram: send code: %w", err)
+	}
+	var codeHash string
+	switch s := sentCode.(type) {
+	case *tg.AuthSentCode:
+		codeHash = s.PhoneCodeHash
+	case *tg.AuthSentCodeSuccess:
+		if onReady != nil {
+			onReady()
+		}
+		p.setReady()
+		<-ctx.Done()
+		return ctx.Err()
+	default:
+		return fmt.Errorf("telegram: unexpected send code response %T", sentCode)
+	}
+
+	p.setNeedsAuth()
+
 	for {
 		var req authRequest
 		var ok bool
@@ -210,30 +343,47 @@ func (p *Provider) awaitSignIn(ctx context.Context) error {
 		if !ok {
 			return nil
 		}
-		err := p.signInWith(ctx, req.code)
+		err := p.signInWithCode(ctx, client, phone, req.code, &codeHash)
+		if err == nil {
+			// Publish api and ready state before unblocking Authenticate so
+			// immediate follow-up calls observe provReady and a valid p.api.
+			if onReady != nil {
+				onReady()
+			}
+			p.setReady()
+		}
 		select {
 		case req.result <- err:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 		if err == nil {
-			p.api = p.client.API()
-			p.setReady()
 			<-ctx.Done()
 			return ctx.Err()
 		}
 	}
 }
 
-func (p *Provider) signInWith(ctx context.Context, code string) error {
-	if p.cfg.Phone == "" {
-		return errors.New("telegram: [telegram] phone is required to sign in")
+func (p *Provider) signInWithCode(ctx context.Context, client tgAuthClient, phone, code string, codeHash *string) error {
+	_, err := client.SignIn(ctx, phone, code, *codeHash)
+	if errors.Is(err, auth.ErrPasswordAuthNeeded) {
+		if p.cfg.Password == "" {
+			return errors.New("telegram: 2FA password required; set password in [telegram]")
+		}
+		if _, passErr := client.Password(ctx, p.cfg.Password); passErr != nil {
+			return fmt.Errorf("telegram: sign in failed: %w", passErr)
+		}
+		return nil
 	}
-	flow := auth.NewFlow(
-		auth.Constant(normalizePhone(p.cfg.Phone), p.cfg.Password, staticCode(code)),
-		auth.SendCodeOptions{},
-	)
-	if err := flow.Run(ctx, p.client.Auth()); err != nil {
+	if err != nil {
+		if tgerr.Is(err, "PHONE_CODE_EXPIRED") {
+			if sent, sendErr := client.SendCode(ctx, phone, auth.SendCodeOptions{}); sendErr == nil {
+				if s, ok := sent.(*tg.AuthSentCode); ok {
+					*codeHash = s.PhoneCodeHash
+					return errors.New("telegram: code expired; a new code was sent to your app")
+				}
+			}
+		}
 		return fmt.Errorf("telegram: sign in failed: %w", err)
 	}
 	return nil
@@ -250,32 +400,39 @@ func (p *Provider) setNeedsAuth()       { p.setStateLocked(provNeedsAuth, playli
 func (p *Provider) setReady()           { p.setStateLocked(provReady, nil) }
 func (p *Provider) setFailed(err error) { p.setStateLocked(provFailed, err) }
 
-func (p *Provider) currentState() provState {
+func (p *Provider) snapshotState() (provState, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.state
+	return p.state, p.connectErr
 }
 
 // wait returns once the connection is usable. playlist.ErrNeedsAuth means the
 // pane must collect the login code; other errors keep the call retryable.
 func (p *Provider) wait() error {
+	p.ensureStarted()
 	deadline := time.Now().Add(connectWait)
+	done := p.doneChan()
 	for {
-		switch p.currentState() {
+		state, connectErr := p.snapshotState()
+		switch state {
 		case provReady:
 			return nil
 		case provNeedsAuth:
 			return playlist.ErrNeedsAuth
 		case provFailed:
-			if err := p.connectErr; err != nil {
-				return err
+			if connectErr != nil {
+				return connectErr
 			}
 			return errors.New("telegram: connection failed")
 		}
 		if time.Now().After(deadline) {
 			return errors.New("telegram: still connecting, try again")
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-done:
+			return errors.New("telegram: provider closed")
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 
@@ -285,6 +442,7 @@ func (p *Provider) Name() string { return "Telegram" }
 // Playlists implements playlist.Provider. With [telegram] chats it returns
 // those chats; otherwise every dialog of the account, grouped by kind.
 func (p *Provider) Playlists() ([]playlist.PlaylistInfo, error) {
+	p.ensureStarted()
 	chats := p.Chats()
 	if len(chats) == 0 {
 		return p.Dialogs()
@@ -292,7 +450,7 @@ func (p *Provider) Playlists() ([]playlist.PlaylistInfo, error) {
 	if err := p.wait(); err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(p.baseContext(), 60*time.Second)
 	defer cancel()
 
 	// An id needs the dialog list for the title, the section and a current
@@ -351,10 +509,11 @@ func (p *Provider) Playlists() ([]playlist.PlaylistInfo, error) {
 // Dialogs lists every dialog of the account, ignoring the chats filter. The
 // setup wizard uses it to offer the chat picker.
 func (p *Provider) Dialogs() ([]playlist.PlaylistInfo, error) {
+	p.ensureStarted()
 	if err := p.wait(); err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(p.baseContext(), 60*time.Second)
 	defer cancel()
 
 	out, err := p.dialogs(ctx)
@@ -380,6 +539,7 @@ func (p *Provider) Tracks(playlistID string) ([]playlist.Track, error) {
 // pages of trackPageSize messages and returns the id of the last message as
 // the next offset (0 when the history is exhausted).
 func (p *Provider) TracksPage(playlistID string, offset int) ([]playlist.Track, int, error) {
+	p.ensureStarted()
 	if err := p.wait(); err != nil {
 		return nil, 0, err
 	}
@@ -387,7 +547,7 @@ func (p *Provider) TracksPage(playlistID string, offset int) ([]playlist.Track, 
 	if err != nil {
 		return nil, 0, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(p.baseContext(), 60*time.Second)
 	defer cancel()
 
 	history, err := p.api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
@@ -904,11 +1064,12 @@ func (p *Provider) resolveChat(ctx context.Context, chat string) (playlist.Playl
 }
 
 // URISchemes implements provider.CustomStreamer.
-func (p *Provider) URISchemes() []string { return []string{"telegram"} }
+func (p *Provider) URISchemes() []string { return []string{uriPrefix} }
 
 // NewStreamer implements provider.CustomStreamer: it starts playback as soon
 // as the configured buffer is on disk and keeps downloading in the background.
 func (p *Provider) NewStreamer(uri string) (beep.StreamSeekCloser, beep.Format, time.Duration, error) {
+	p.ensureStarted()
 	if err := p.wait(); err != nil {
 		return nil, beep.Format{}, 0, err
 	}
@@ -945,7 +1106,11 @@ func docDuration(doc *tg.Document) int {
 }
 
 func safeChat(chat string) string {
-	return strings.NewReplacer("/", "_", "\\", "_", ":", "_", "@", "").Replace(chat)
+	s := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "@", "").Replace(chat)
+	if s == "" || s == "." || s == ".." {
+		return "_"
+	}
+	return s
 }
 
 func extensionFor(doc *tg.Document) string {

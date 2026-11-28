@@ -1,5 +1,7 @@
 package config
 
+import "math"
+
 // Overrides holds CLI flag values. Nil pointers mean "not set".
 type Overrides struct {
 	Volume          *float64
@@ -28,7 +30,11 @@ type Overrides struct {
 // Apply merges non-nil overrides into cfg and clamps the result.
 func (o Overrides) Apply(cfg *Config) {
 	if o.Volume != nil {
-		cfg.Volume = *o.Volume
+		if math.IsNaN(*o.Volume) || math.IsInf(*o.Volume, 0) {
+			cfg.Volume = defaultConfig().Volume
+		} else {
+			cfg.Volume = *o.Volume
+		}
 	}
 	if o.Shuffle != nil {
 		cfg.Shuffle = *o.Shuffle
@@ -86,9 +92,21 @@ func (o Overrides) Apply(cfg *Config) {
 	}
 	if o.LowPower != nil {
 		cfg.LowPower = *o.LowPower
+		if !*o.LowPower && cfg.lowPowerClamped {
+			if o.Visualizer == nil {
+				cfg.Visualizer = cfg.lowPowerSavedVis
+			}
+			cfg.lowPowerSavedVis = ""
+			cfg.lowPowerClamped = false
+		}
 	}
 	if o.ExpandPlaylist != nil {
 		cfg.YouTubeMusic.ExpandPlaylist = o.ExpandPlaylist
 	}
 	cfg.clamp()
+	// An explicit CLI --visualizer overrides low_power from config.toml unless
+	// --low-power was also passed on the CLI.
+	if o.Visualizer != nil && (o.LowPower == nil || !*o.LowPower) {
+		cfg.Visualizer = *o.Visualizer
+	}
 }

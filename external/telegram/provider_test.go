@@ -1,10 +1,19 @@
 package telegram
 
 import (
+	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/bjarneo/cliamp/config"
 	"github.com/bjarneo/cliamp/playlist"
+	"github.com/bjarneo/cliamp/provider"
+	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/tg"
 )
 
@@ -265,5 +274,374 @@ func TestTopMessageDateMatchesThePeer(t *testing.T) {
 	}
 	if got := topMessageDate(messages, &tg.PeerChat{ChatID: 3}, 7); got != 0 {
 		t.Fatalf("topMessageDate() = %d, want 0 when no message matches the peer", got)
+	}
+}
+
+func TestAuthenticateForwardsCode(t *testing.T) {
+	tests := []struct {
+		name    string
+		code    string
+		wantErr error
+	}{
+		{name: "valid numeric code", code: "12345"},
+		{name: "different code with rejection", code: "98765", wantErr: errors.New("invalid code")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			p := &Provider{
+				ctx:     ctx,
+				cancel:  cancel,
+				authReq: make(chan authRequest),
+			}
+			p.setNeedsAuth()
+
+			gotCode := make(chan string, 1)
+			go func() {
+				req := <-p.authReq
+				gotCode <- req.code
+				req.result <- tt.wantErr
+			}()
+
+			err := p.Authenticate(tt.code)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Authenticate(%q) error = %v, want %v", tt.code, err, tt.wantErr)
+			}
+			if got := <-gotCode; got != tt.code {
+				t.Fatalf("received code = %q, want %q", got, tt.code)
+			}
+		})
+	}
+}
+
+func TestWaitConcurrentStateTransition(t *testing.T) {
+	p := &Provider{authReq: make(chan authRequest)}
+	wantErr := errors.New("connect failed")
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 50 {
+			p.setFailed(wantErr)
+			p.setNeedsAuth()
+			p.setReady()
+		}
+		p.setFailed(wantErr)
+	}()
+	go func() {
+		defer wg.Done()
+		for range 50 {
+			_ = p.wait()
+		}
+	}()
+	wg.Wait()
+
+	if err := p.wait(); !errors.Is(err, wantErr) {
+		t.Fatalf("wait() = %v, want %v", err, wantErr)
+	}
+}
+
+func TestCloseCancelsContextAndWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &Provider{
+		ctx:     ctx,
+		cancel:  cancel,
+		authReq: make(chan authRequest),
+	}
+	var closer provider.Closer = p
+
+	waitErr := make(chan error, 1)
+	go func() {
+		waitErr <- p.wait()
+	}()
+
+	closer.Close()
+	closer.Close()
+
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("Close did not cancel provider context")
+	}
+	if err := <-waitErr; err == nil {
+		t.Fatal("wait() should return an error after Close")
+	}
+}
+
+func TestNewFromConfigDefersStartUntilFirstAccess(t *testing.T) {
+	sessionDir := filepath.Join(t.TempDir(), "nested", "session")
+	cfg := config.TelegramConfig{
+		AppID:       123456,
+		AppHash:     "0123456789abcdef0123456789abcdef",
+		SessionFile: filepath.Join(sessionDir, "telegram.session"),
+	}
+
+	// NewFromConfig must not create the session directory or connect during startup.
+	unused := NewFromConfig(cfg)
+	if unused == nil {
+		t.Fatal("NewFromConfig() returned nil for valid config")
+	}
+	if _, err := os.Stat(sessionDir); !os.IsNotExist(err) {
+		t.Fatalf("NewFromConfig() created session dir eagerly: %v", err)
+	}
+	unused.Close()
+	unused.Close()
+
+	tests := []struct {
+		name   string
+		invoke func(p *Provider)
+	}{
+		{
+			name:   "wait",
+			invoke: func(p *Provider) { _ = p.wait() },
+		},
+		{
+			name:   "Playlists",
+			invoke: func(p *Provider) { _, _ = p.Playlists() },
+		},
+		{
+			name:   "Dialogs",
+			invoke: func(p *Provider) { _, _ = p.Dialogs() },
+		},
+		{
+			name:   "TracksPage",
+			invoke: func(p *Provider) { _, _, _ = p.TracksPage("c:1", 0) },
+		},
+		{
+			name:   "Authenticate",
+			invoke: func(p *Provider) { _ = p.Authenticate("12345") },
+		},
+		{
+			name: "SetChats",
+			invoke: func(p *Provider) {
+				_ = p.SetChats([]string{"c:1"})
+			},
+		},
+		{
+			name:   "NewStreamer",
+			invoke: func(p *Provider) { _, _, _, _ = p.NewStreamer("telegram:c:1:10") },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("CLIAMP_CONFIG_DIR", t.TempDir())
+			p := NewFromConfig(cfg)
+			t.Cleanup(p.Close)
+
+			var starts atomic.Int32
+			started := make(chan struct{})
+			p.runFn = func() {
+				if starts.Add(1) == 1 {
+					close(started)
+				}
+				p.setFailed(errors.New("stubbed"))
+			}
+
+			if starts.Load() != 0 {
+				t.Fatal("background runner started before first method call")
+			}
+
+			tt.invoke(p)
+			select {
+			case <-started:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("%s did not trigger lazy start", tt.name)
+			}
+
+			// Repeated access must not start the runner a second time.
+			_ = p.wait()
+			if got := starts.Load(); got != 1 {
+				t.Fatalf("start count = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestCloseBeforeLazyStartPreventsRun(t *testing.T) {
+	cfg := config.TelegramConfig{
+		AppID:       123456,
+		AppHash:     "0123456789abcdef0123456789abcdef",
+		SessionFile: filepath.Join(t.TempDir(), "telegram.session"),
+	}
+	p := NewFromConfig(cfg)
+
+	var starts atomic.Int32
+	p.runFn = func() {
+		starts.Add(1)
+	}
+
+	p.Close()
+	p.Close()
+
+	if err := p.wait(); err == nil {
+		t.Fatal("wait() after Close() succeeded, want error")
+	}
+	if got := starts.Load(); got != 0 {
+		t.Fatalf("runner started %d times after Close(), want 0", got)
+	}
+}
+
+func TestEnsureStartedConcurrent(t *testing.T) {
+	cfg := config.TelegramConfig{
+		AppID:       123456,
+		AppHash:     "0123456789abcdef0123456789abcdef",
+		SessionFile: filepath.Join(t.TempDir(), "telegram.session"),
+	}
+	p := NewFromConfig(cfg)
+	t.Cleanup(p.Close)
+
+	var starts atomic.Int32
+	p.runFn = func() {
+		starts.Add(1)
+		p.setFailed(errors.New("stubbed"))
+	}
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = p.wait()
+		}()
+	}
+	wg.Wait()
+
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("concurrent start count = %d, want 1", got)
+	}
+}
+
+type fakeTGAuthClient struct {
+	mu           sync.Mutex
+	sendCalls    int
+	signInHashes []string
+	signInCodes  []string
+	needPassword bool
+	gotPassword  string
+}
+
+func (f *fakeTGAuthClient) SendCode(_ context.Context, _ string, _ auth.SendCodeOptions) (tg.AuthSentCodeClass, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sendCalls++
+	return &tg.AuthSentCode{PhoneCodeHash: "hash-1"}, nil
+}
+
+func (f *fakeTGAuthClient) SignIn(_ context.Context, _, code, codeHash string) (*tg.AuthAuthorization, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.signInCodes = append(f.signInCodes, code)
+	f.signInHashes = append(f.signInHashes, codeHash)
+	if code != "54321" {
+		return nil, errors.New("PHONE_CODE_INVALID")
+	}
+	if f.needPassword {
+		return nil, auth.ErrPasswordAuthNeeded
+	}
+	return &tg.AuthAuthorization{}, nil
+}
+
+func (f *fakeTGAuthClient) Password(_ context.Context, password string) (*tg.AuthAuthorization, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gotPassword = password
+	return &tg.AuthAuthorization{}, nil
+}
+
+func TestAwaitSignInSendsCodeOnceAndMarksReadyBeforeReturning(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := &Provider{
+		cfg:     config.TelegramConfig{Phone: "+15551234567", Password: "secret"},
+		ctx:     ctx,
+		cancel:  cancel,
+		authReq: make(chan authRequest),
+	}
+	fake := &fakeTGAuthClient{needPassword: true}
+	var readySet atomic.Bool
+
+	go func() {
+		_ = p.awaitSignIn(ctx, fake, func() { readySet.Store(true) })
+	}()
+
+	// Wait until SendCode has run and provider transitioned to provNeedsAuth.
+	if err := p.wait(); !errors.Is(err, playlist.ErrNeedsAuth) {
+		t.Fatalf("initial wait() = %v, want ErrNeedsAuth", err)
+	}
+	// Wrong code must fail without calling SendCode again.
+	if err := p.Authenticate("00000"); err == nil {
+		t.Fatal("Authenticate(wrong code) = nil, want error")
+	}
+	// Correct code must succeed with the same hash and mark ready BEFORE returning.
+	if err := p.Authenticate("54321"); err != nil {
+		t.Fatalf("Authenticate(54321) = %v, want nil", err)
+	}
+	if !readySet.Load() {
+		t.Fatal("onReady did not run before Authenticate returned")
+	}
+	if err := p.wait(); err != nil {
+		t.Fatalf("wait() right after Authenticate = %v, want nil (ready)", err)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.sendCalls != 1 {
+		t.Fatalf("SendCode calls = %d, want 1", fake.sendCalls)
+	}
+	if fake.gotPassword != "secret" {
+		t.Fatalf("2FA password = %q, want secret", fake.gotPassword)
+	}
+	if len(fake.signInHashes) != 2 || fake.signInHashes[0] != "hash-1" || fake.signInHashes[1] != "hash-1" {
+		t.Fatalf("SignIn hashes = %v, want [hash-1 hash-1]", fake.signInHashes)
+	}
+}
+
+func TestURISchemesIncludesTrailingColonAndSafeChatBlocksDotDot(t *testing.T) {
+	p := &Provider{}
+	schemes := p.URISchemes()
+	if len(schemes) != 1 || schemes[0] != "telegram:" {
+		t.Fatalf("URISchemes() = %v, want [telegram:]", schemes)
+	}
+	for _, bad := range []string{"", ".", ".."} {
+		if got := safeChat(bad); got == "" || got == "." || got == ".." {
+			t.Fatalf("safeChat(%q) = %q, want safe directory name", bad, got)
+		}
+	}
+}
+
+func TestRefreshRestartsAfterTransientFailure(t *testing.T) {
+	cfg := config.TelegramConfig{
+		AppID:       123456,
+		AppHash:     "0123456789abcdef0123456789abcdef",
+		SessionFile: filepath.Join(t.TempDir(), "telegram.session"),
+	}
+	p := NewFromConfig(cfg)
+	t.Cleanup(p.Close)
+
+	var starts atomic.Int32
+	done := make(chan struct{}, 2)
+	p.runFn = func() {
+		if starts.Add(1) == 1 {
+			p.setFailed(errors.New("transient dns error"))
+		} else {
+			p.setReady()
+		}
+		done <- struct{}{}
+	}
+
+	if err := p.wait(); err == nil {
+		t.Fatal("first wait() = nil, want transient error")
+	}
+	<-done
+	p.Refresh()
+	if err := p.wait(); err != nil {
+		t.Fatalf("wait() after Refresh() = %v, want nil", err)
+	}
+	<-done
+	if got := starts.Load(); got != 2 {
+		t.Fatalf("starts = %d, want 2", got)
 	}
 }

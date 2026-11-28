@@ -26,7 +26,7 @@ func (m *Model) handleNetSearchResults(msg netSearchResultsMsg) {
 
 // handleSearchOverlayResults shows the track results of a provider search.
 func (m *Model) handleSearchOverlayResults(msg searchOverlayResultsMsg) {
-	if !m.isCurrentSearchOverlayRequest(msg.gen, msg.providerName) || m.searchOverlay.query != msg.query {
+	if !m.isCurrentSearchOverlayRequest(msg.gen, msg.providerName) || m.searchOverlay.request != msg.query {
 		return
 	}
 	m.cancelSearchOverlayRequest()
@@ -44,8 +44,8 @@ func (m *Model) handleSearchOverlayResults(msg searchOverlayResultsMsg) {
 	m.clampActiveScrollState()
 }
 
-// handleSearchOverlayAlbumTracks plays, appends or queues the tracks of an album
-// that the provider search expanded.
+// handleSearchOverlayAlbumTracks plays, appends, queues or replaces the queue with
+// the tracks of an album that the provider search expanded.
 func (m *Model) handleSearchOverlayAlbumTracks(msg searchOverlayAlbumTracksMsg) tea.Cmd {
 	if msg.gen != m.requests.searchOverlayAlbum {
 		return nil
@@ -62,12 +62,16 @@ func (m *Model) handleSearchOverlayAlbumTracks(msg searchOverlayAlbumTracksMsg) 
 	}
 	album := msg.album
 	tracks := msg.tracks
-	m.closeSearchOverlay()
+	if msg.action == searchOverlayAlbumPlay || msg.action == searchOverlayAlbumReplace || !m.keepSearchOpen {
+		m.closeSearchOverlay()
+	}
 	switch msg.action {
 	case searchOverlayAlbumAppend:
 		return m.appendAlbum(album, tracks)
 	case searchOverlayAlbumQueueNext:
 		return m.queueAlbumNext(album, tracks)
+	case searchOverlayAlbumReplace:
+		return m.replaceWithAlbum(album, tracks)
 	default:
 		return m.playAlbumImmediate(album, tracks)
 	}

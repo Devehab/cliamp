@@ -3,7 +3,6 @@ package model
 
 import (
 	"context"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -123,12 +122,7 @@ func (m Model) mainFocusAreas() []focusArea {
 	}
 	if m.layout.twoColumn {
 		rows := m.effectivePlaylistVisible()
-		for _, row := range m.settingsPaneRows(rows - m.metadataPaneRows(rows)) {
-			if row.focus != focusPlaylist {
-				areas = append(areas, row.focus)
-			}
-		}
-		return areas
+		return append(areas, m.settingsPaneFocusAreas(rows-m.metadataPaneRows(rows))...)
 	}
 	if len(m.providers) > 1 {
 		areas = append(areas, focusProvPill)
@@ -140,11 +134,8 @@ func (m Model) mainFocusAreas() []focusArea {
 		areas = append(areas, focusEQ)
 	}
 	if m.playlist != nil {
-		// Probe each focused badge: its extra label must fit too, independent
-		// of the current focus or an overlay temporarily replacing the header.
 		for _, area := range []focusArea{focusShuffle, focusRepeat} {
-			m.focus = area
-			if strings.Contains(m.renderPlaybackHeader(), "["+area.label()+" ") {
+			if m.playbackHeaderBadgeFits(area) {
 				areas = append(areas, area)
 			}
 		}
@@ -321,6 +312,14 @@ type Model struct {
 	luaSelect          *luaSelectState
 	artRef             *artRef
 	slotVis            *slotVisualizers
+	lastPrunedPaneGen  uint64
+	panePruned         bool
+	helpCache          *helpRenderCache
+	playlistCache      *playlistRenderCache
+	settingsCache      *settingsRenderCache
+	titleCache         *titleRenderCache
+	bodyCache          *bodyRenderCache
+	visTick            *visTickScratch
 	downloadsDirectory string
 	// audioDevice names the output device that the last device switch or
 	// list reported. The runtime snapshot shows it.
@@ -359,6 +358,9 @@ type Model struct {
 	width           int
 	height          int
 	layout          frameLayout
+	layoutKey       layoutInputs
+	layoutValid     bool
+	clockFresh      bool
 	textInput       textEditor
 	layoutText      string // what the layout typed for the key physicalKey rewrote, while it is handled
 	layoutKeysOff   bool   // the terminal can't send the typed text with key positions; see handleKeyboardEnhancements
@@ -419,6 +421,12 @@ type Model struct {
 	// ytdlArtistCancel stops the uploader lookup of the playing track. The
 	// next track start calls it, so a fast skip ends the yt-dlp process.
 	ytdlArtistCancel context.CancelFunc
+	// lyricsCancel stops the active lyrics lookup.
+	lyricsCancel *cancelSlot
+	// navCancel stops the active provider browser batch load.
+	navCancel *cancelSlot
+	// ipcProviderLoadGen tracks the latest IPC provider load request.
+	ipcProviderLoadGen uint64
 
 	spinnerTicking bool // a spinnerTickMsg is pending
 
@@ -509,7 +517,9 @@ type Model struct {
 	// switches providers while it keeps playing.
 	playingProvider string
 
-	notifier playback.Notifier
+	// artworkCache holds the last resolved non-empty cover URL for the active track.
+	artworkCache *artworkCache
+	notifier     playback.Notifier
 	// notice is the playback state that the notifier and the playback.state
 	// plugin event got last. Update keeps it in the Model that it returns.
 	notice playbackNotice
@@ -553,6 +563,7 @@ type Model struct {
 	// favSet is a cached set of favorited paths for O(1) lookup during
 	// rendering. Refreshed on init and after every toggle.
 	favSet map[string]struct{}
+	favGen uint64
 
 	// initialDir is the starting path for the file browser ('o' key).
 	initialDir string
@@ -586,15 +597,19 @@ type Model struct {
 	headless       bool // no screen: cliamp --daemon runs without a renderer
 	simplified     bool // simplified playback view: track summary and time strip
 	hideTrackInfo  bool // full-screen visualizer: show the source instead of the track
+	pureVis        bool // full-screen visualizer: draw only the visualizer, edge to edge (key f)
 	hideHelpBar    bool // hide the key-binding hint bar above the status line
 	hideSettings   bool // close the two-column settings pane beside the playlist
+	keepSearchOpen bool // keep the Ctrl+F results open after q or a
 	showMetadata   bool // expand highlighted-track metadata below settings
 	heightExpanded bool // tracks whether manual 'x' expansion is active
 
 	// Cached per-tick to avoid repeated speaker.Lock() calls in View().
-	cachedPos  time.Duration
-	cachedDur  time.Duration
-	lastTickAt time.Time // wall time of previous tickMsg; used for tick delta
+	cachedPos       time.Duration
+	cachedDur       time.Duration
+	cachedSeekable  bool
+	cachedStreamErr error
+	lastTickAt      time.Time // wall time of previous tickMsg; used for tick delta
 
 }
 

@@ -102,21 +102,32 @@ func FetchUserPlaylists(browser string) ([]playlist.PlaylistInfo, error) {
 	defer cancel()
 
 	args := []string{"--flat-playlist", "-j", "--socket-timeout", "15"}
-	b := strings.TrimSpace(browser)
-	if b == "" {
-		b = ytdlcookies.ForURL("https://www.youtube.com/feed/playlists")
-	}
-	if b != "" {
+	if b := strings.TrimSpace(browser); b != "" {
 		args = append(args, "--cookies-from-browser", b)
+	} else {
+		cookieArgs, cleanup, err := ytdlcookies.Args("https://www.youtube.com/feed/playlists")
+		defer cleanup()
+		if err != nil {
+			return nil, fmt.Errorf("yt-dlp: %w", err)
+		}
+		args = append(args, cookieArgs...)
 	}
 	args = append(args, "--", "https://www.youtube.com/feed/playlists")
 
 	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
 	cmd.WaitDelay = 3 * time.Second
-	var stderr strings.Builder
+	stderr := cappedBuffer{limit: maxYTDLStderrBytes}
 	cmd.Stderr = &stderr
-	stdout, err := cmd.Output()
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		return nil, fmt.Errorf("yt-dlp: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("yt-dlp: %w", err)
+	}
+	pls, parseErr := parseYTDLPlaylistFeed(stdout)
+	_, _ = io.Copy(io.Discard, stdout)
+	if err := cmd.Wait(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("yt-dlp: timed out fetching playlists (30s)")
 		}
@@ -126,10 +137,8 @@ func FetchUserPlaylists(browser string) ([]playlist.PlaylistInfo, error) {
 		}
 		return nil, fmt.Errorf("yt-dlp: %w", err)
 	}
-
-	pls, err := parseYTDLPlaylistFeed(bytes.NewReader(stdout))
-	if err != nil {
-		return nil, fmt.Errorf("yt-dlp: %w", err)
+	if parseErr != nil {
+		return nil, fmt.Errorf("yt-dlp: %w", parseErr)
 	}
 	return pls, nil
 }

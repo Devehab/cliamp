@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -138,6 +139,35 @@ func TestParseLevel(t *testing.T) {
 				t.Errorf("level = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestInitStaleCloseDoesNotCloseNewerLogFile(t *testing.T) {
+	reset(t)
+	dir := t.TempDir()
+	close1, err := Init(filepath.Join(dir, "one.log"), LevelInfo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close2, err := Init(filepath.Join(dir, "two.log"), LevelInfo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer close2()
+
+	if err := close1(); err != nil {
+		t.Fatalf("stale close1() error = %v", err)
+	}
+	Info("still-open")
+	if err := close2(); err != nil {
+		t.Fatalf("close2() error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "two.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "still-open") {
+		t.Fatalf("two.log = %q, want entry written after stale close1()", data)
 	}
 }
 
@@ -299,5 +329,21 @@ func TestInitMissingDirCreatesIt(t *testing.T) {
 	t.Cleanup(func() { _ = closeFn() })
 	if _, err := os.Stat(nested); err != nil {
 		t.Errorf("log file not created: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		dirInfo, err := os.Stat(filepath.Dir(nested))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := dirInfo.Mode().Perm(); got != 0o700 {
+			t.Errorf("log dir mode = %o, want 700", got)
+		}
+		fileInfo, err := os.Stat(nested)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := fileInfo.Mode().Perm(); got != 0o600 {
+			t.Errorf("log file mode = %o, want 600", got)
+		}
 	}
 }

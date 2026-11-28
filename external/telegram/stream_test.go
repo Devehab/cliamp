@@ -127,3 +127,56 @@ func TestStreamSourceInterruptEndsWaitingRead(t *testing.T) {
 		}
 	})
 }
+
+func TestOpenPartialPairCleansUpOnOpenError(t *testing.T) {
+	dir := t.TempDir()
+	orig := openPartialReader
+	openPartialReader = func(string) (*os.File, error) {
+		return nil, errors.New("open denied")
+	}
+	t.Cleanup(func() { openPartialReader = orig })
+
+	if _, _, _, err := openPartialPair(dir, 42); err == nil {
+		t.Fatal("openPartialPair() expected error")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("leftover partial files in %s: %d", dir, len(entries))
+	}
+}
+
+func TestStreamSourceCloseInterruptsBlockedRead(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		file, err := os.CreateTemp(t.TempDir(), "tg-close-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := newStreamSource(file)
+		readDone := make(chan error, 1)
+		go func() {
+			_, err := source.Read(make([]byte, 16))
+			readDone <- err
+		}()
+		synctest.Wait()
+
+		if err := source.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+		// Double Close must be safe.
+		if err := source.Close(); err != nil {
+			t.Fatalf("second Close() error = %v", err)
+		}
+		synctest.Wait()
+		select {
+		case err := <-readDone:
+			if !errors.Is(err, errStreamInterrupted) {
+				t.Fatalf("Read() after Close error = %v, want %v", err, errStreamInterrupted)
+			}
+		default:
+			t.Fatal("Read() remained blocked after Close()")
+		}
+	})
+}

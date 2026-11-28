@@ -7,6 +7,7 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -70,6 +71,9 @@ func parseXiaoyuzhouEpisodeHTML(pageURL, doc string) (playlist.Track, error) {
 	if audioURL == "" {
 		return playlist.Track{}, fmt.Errorf("audio URL not found")
 	}
+	if !isValidXiaoyuzhouAudioURL(audioURL) {
+		return playlist.Track{}, fmt.Errorf("invalid audio URL %q", audioURL)
+	}
 	if title == "" {
 		title = schema.Name
 	}
@@ -86,12 +90,22 @@ func parseXiaoyuzhouEpisodeHTML(pageURL, doc string) (playlist.Track, error) {
 	}, nil
 }
 
+// isValidXiaoyuzhouAudioURL requires an http or https URL with a host and no userinfo.
+func isValidXiaoyuzhouAudioURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	return (scheme == "http" || scheme == "https") && u.Host != "" && u.User == nil
+}
+
 func extractXiaoyuzhouSchemaJSON(doc string) string {
 	m := xiaoyuzhouSchemaScriptRe.FindStringSubmatch(doc)
 	if len(m) < 2 {
 		return ""
 	}
-	return html.UnescapeString(strings.TrimSpace(m[1]))
+	return strings.TrimSpace(m[1])
 }
 
 func extractMetaContent(doc, attr, value string) string {

@@ -552,6 +552,21 @@ func TestTelegramSetupBody(t *testing.T) {
 	if cfg.AppID != 123456 || cfg.AppHash != hash || cfg.Phone != "+5491100000000" || cfg.BufferMB != 4 {
 		t.Fatalf("telegramConfigFrom = %+v", cfg)
 	}
+
+	// Env variable references in string fields expand for validation and runtime config.
+	t.Setenv("TEST_TG_HASH", hash)
+	t.Setenv("TEST_TG_PHONE", "+5491100000000")
+	t.Setenv("TEST_TG_PASS", "top-secret")
+	envVals := map[string]string{
+		"api_id": "123456", "api_hash": "$TEST_TG_HASH", "phone": "${TEST_TG_PHONE}", "password": "$TEST_TG_PASS", "buffer_mb": "2",
+	}
+	if err := spec.extraValidate(envVals); err != nil {
+		t.Fatalf("extraValidate(env refs) = %v, want nil", err)
+	}
+	envCfg := telegramConfigFrom(envVals)
+	if envCfg.AppHash != hash || envCfg.Phone != "+5491100000000" || envCfg.Password != "top-secret" {
+		t.Fatalf("telegramConfigFrom(env refs) = %+v, want expanded values", envCfg)
+	}
 }
 
 func TestChatKey(t *testing.T) {
@@ -987,4 +1002,72 @@ func TestYTMusicCustomModeIncludesOptionalCookies(t *testing.T) {
 	}
 
 	checkBody(t, spec.body(values), map[string]string{"cookies_from": `"firefox"`})
+}
+
+func TestChatsLoadedIgnoresStaleGeneration(t *testing.T) {
+	m := newSetupModel()
+	tgIdx := -1
+	for i, p := range m.provs {
+		if p.section == "telegram" {
+			tgIdx = i
+			break
+		}
+	}
+	if tgIdx < 0 {
+		t.Fatal("telegram spec missing")
+	}
+	m.pidx = tgIdx
+
+	// Open picker (gen 1), cancel with esc (gen 2), reopen (gen 3).
+	m.openChats()
+	gen1 := m.chatLoadGen
+	m.chatsKey(keyPress(tea.KeyEscape, ""))
+	m.openChats()
+	genCurrent := m.chatLoadGen
+	if genCurrent <= gen1 {
+		t.Fatalf("reopened generation = %d, want > %d", genCurrent, gen1)
+	}
+
+	tests := []struct {
+		name        string
+		msg         chatsLoadedMsg
+		wantLoading bool
+		wantCount   int
+		wantFirstID string
+	}{
+		{
+			name:        "stale generation is ignored",
+			msg:         chatsLoadedMsg{gen: gen1, options: []chatOption{{ID: "ch:1:1", Name: "Stale"}}},
+			wantLoading: true,
+			wantCount:   0,
+		},
+		{
+			name:        "wrong future generation is ignored",
+			msg:         chatsLoadedMsg{gen: genCurrent + 1, options: []chatOption{{ID: "ch:2:2", Name: "Future"}}},
+			wantLoading: true,
+			wantCount:   0,
+		},
+		{
+			name:        "current generation populates picker",
+			msg:         chatsLoadedMsg{gen: genCurrent, options: []chatOption{{ID: "ch:3:3", Name: "Fresh"}}},
+			wantLoading: false,
+			wantCount:   1,
+			wantFirstID: "ch:3:3",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m.Update(tt.msg)
+			if m.chatLoading != tt.wantLoading {
+				t.Fatalf("chatLoading = %v, want %v", m.chatLoading, tt.wantLoading)
+			}
+			if len(m.chatItems) != tt.wantCount {
+				t.Fatalf("len(chatItems) = %d, want %d", len(m.chatItems), tt.wantCount)
+			}
+			if tt.wantFirstID != "" && m.chatItems[0].ID != tt.wantFirstID {
+				t.Fatalf("chatItems[0].ID = %q, want %q", m.chatItems[0].ID, tt.wantFirstID)
+			}
+		})
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/bjarneo/cliamp/history"
 	"github.com/bjarneo/cliamp/playlist"
 	"github.com/bjarneo/cliamp/provider"
 	"github.com/bjarneo/cliamp/theme"
@@ -197,6 +198,51 @@ func (m *Model) searchOverlayResultsVisible() int {
 
 func (m *Model) plMgrListMaybeAdjustScroll(visible int) {
 	clampScroll(&m.plManager.cursor, &m.plManager.scroll, m.plMgrListViewCount(), visible)
+	for visible > 0 && m.plManager.scroll < m.plManager.cursor &&
+		m.plMgrListRowsToCursor(m.plManager.scroll, m.plManager.cursor) > visible {
+		m.plManager.scroll++
+	}
+}
+
+func (m Model) plMgrListRowsToCursor(scroll, cursor int) int {
+	visibleN := len(m.plManager.playlists)
+	if m.plManager.filter != "" {
+		visibleN = len(m.plManager.filtered)
+	}
+	if visibleN == 0 {
+		return 1
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+	if scroll > visibleN {
+		scroll = visibleN
+	}
+	foundUser := false
+	for i := range scroll {
+		if m.plManager.playlists[m.plMgrPlaylistRealIndex(i)].Name != history.PlaylistName {
+			foundUser = true
+			break
+		}
+	}
+	rows := 0
+	for i := scroll; i < visibleN && i <= cursor; i++ {
+		p := m.plManager.playlists[m.plMgrPlaylistRealIndex(i)]
+		if p.Name != history.PlaylistName {
+			if !foundUser && i > scroll {
+				rows++
+			}
+			foundUser = true
+		}
+		rows++
+	}
+	if cursor >= visibleN {
+		if scroll < visibleN {
+			rows++
+		}
+		rows++
+	}
+	return rows
 }
 
 func (m *Model) plMgrDirsMaybeAdjustScroll(visible int) {
@@ -204,7 +250,7 @@ func (m *Model) plMgrDirsMaybeAdjustScroll(visible int) {
 }
 
 func (m *Model) plMgrTracksMaybeAdjustScroll(visible int) {
-	if m.plManager.filter != "" || !m.showAlbumHeaders {
+	if m.plManager.filter != "" || !m.plManager.showAlbumHeaders {
 		clampScroll(&m.plManager.cursor, &m.plManager.scroll, m.plMgrTracksViewCount(), visible)
 		return
 	}
@@ -214,6 +260,9 @@ func (m *Model) plMgrTracksMaybeAdjustScroll(visible int) {
 	}
 	if m.plManager.cursor < m.plManager.scroll {
 		m.plManager.scroll = m.plManager.cursor
+	}
+	if visible > 0 {
+		m.plManager.scroll = max(m.plManager.scroll, m.plManager.cursor-visible+1)
 	}
 	m.plManager.scroll = m.fitHeaderScroll(tracks, m.plManager.scroll, m.plManager.cursor, visible, true)
 }
@@ -269,7 +318,7 @@ func (m *Model) plMgrEnterTrackList(name string) {
 	m.plMgrLoadTracks(tracks)
 	m.plManager.marked = make(map[int]bool)
 	m.plManager.sortMode = 0
-	m.setHeaderStateFromTracks(tracks)
+	m.plManager.showAlbumHeaders = tracksHaveAlbumCohesion(tracks)
 	m.plManager.screen = plMgrScreenTracks
 	m.plManager.cursor = 0
 	m.plManager.scroll = 0
@@ -288,7 +337,7 @@ func (m *Model) plMgrReloadTracks(name string) {
 		return
 	}
 	m.plMgrLoadTracks(tracks)
-	m.setHeaderStateFromTracks(tracks)
+	m.plManager.showAlbumHeaders = tracksHaveAlbumCohesion(tracks)
 	m.plManager.marked = make(map[int]bool)
 	if m.plManager.filter != "" {
 		m.plMgrRecomputeFilter()
@@ -408,7 +457,7 @@ func (m *Model) plMgrRefreshTracksForSel() {
 	// track slice; assigning tracks directly would leave stale per-track
 	// missing-file indicators mapped onto the wrong entries.
 	m.plMgrLoadTracks(tracks)
-	m.setHeaderStateFromTracks(tracks)
+	m.plManager.showAlbumHeaders = tracksHaveAlbumCohesion(tracks)
 }
 
 // fbAddDirSource adds directories as [[dir]] sources on the target playlist:
