@@ -154,7 +154,7 @@ func TestLRCFileNextToLocalTrack(t *testing.T) {
 			if query == "" {
 				t.Fatal("lyricsLookupKey() is empty, so the lyrics are never looked up")
 			}
-			msg := fetchTrackLyricsCmd(tt.track, tt.track.Artist, tt.track.Title, query, 1, []trackLyricsSource{other})().(lyricsLoadedMsg)
+			msg := fetchTrackLyricsCmd(context.Background(), tt.track, tt.track.Artist, tt.track.Title, query, 1, []trackLyricsSource{other})().(lyricsLoadedMsg)
 			if tt.wantText == "" {
 				if !errors.Is(msg.err, lyrics.ErrNotFound) {
 					t.Fatalf("lines = %+v, %v, want ErrNotFound", msg.lines, msg.err)
