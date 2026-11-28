@@ -573,7 +573,7 @@ func resolveM3U(ctx context.Context, m3uURL string) ([]playlist.Track, error) {
 		return nil, err
 	}
 	for i := range entries {
-		entries[i].Path = resolveAgainstURL(m3uURL, entries[i].Path)
+		entries[i].Path = resolveAgainstURL(responseBaseURL(resp, m3uURL), entries[i].Path)
 	}
 	return remoteM3UEntriesToTracks(filterRemoteM3UEntries(entries)), nil
 }
@@ -606,9 +606,18 @@ func resolvePLS(ctx context.Context, plsURL string) ([]playlist.Track, error) {
 		return nil, err
 	}
 	for i := range entries {
-		entries[i].File = resolveAgainstURL(plsURL, entries[i].File)
+		entries[i].File = resolveAgainstURL(responseBaseURL(resp, plsURL), entries[i].File)
 	}
 	return remotePLSEntriesToTracks(filterRemotePLSEntries(entries)), nil
+}
+
+// responseBaseURL returns the final URL that produced resp, following any
+// redirects, and falls back to requested when the response carries no request.
+func responseBaseURL(resp *http.Response, requested string) string {
+	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
+		return resp.Request.URL.String()
+	}
+	return requested
 }
 
 // resolveAgainstURL resolves a relative entry of a remote playlist against the
