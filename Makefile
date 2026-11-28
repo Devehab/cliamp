@@ -7,10 +7,13 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 STATICCHECK_VERSION ?= v0.6.1
 GOVULNCHECK_VERSION ?= v1.1.4
 
-.PHONY: build test vet lint staticcheck tools fmt fmt-check tidy-check coverage security ci check clean install
+.PHONY: build run test vet lint staticcheck tools fmt fmt-check tidy-check coverage security ci check clean install
 
 build:
 	go build -trimpath -ldflags="$(LDFLAGS)" -o $(BINARY) .
+
+run: build
+	./$(BINARY)
 
 test:
 	go test ./...
